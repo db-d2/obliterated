@@ -1,0 +1,46 @@
+[project]
+name = "obliterated"
+version = "0.1.0"
+description = "Detecting refusal-direction ablation (abliteration) and measuring susceptibility to it"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    # Linux: the PyPI torch wheel ships with CUDA. macOS: the same wheel uses MPS.
+    "torch>=2.6",
+    "transformers>=4.56",
+    "accelerate>=1.3",
+    "safetensors>=0.5",
+    "huggingface_hub>=0.28",
+    "datasets>=3.2",
+    "pandas>=2.2",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    "matplotlib>=3.9",
+]
+
+[project.optional-dependencies]
+# Capability evals (MMLU, GSM8K, WMDP-Cyber).
+eval = ["lm-eval>=0.4.8"]
+# Fast batched generation on the PC. CUDA only.
+fast = ["vllm>=0.8; sys_platform == 'linux'"]
+# Run the judge or a second model natively on Apple silicon.
+mac = ["mlx-lm>=0.21; sys_platform == 'darwin'"]
+# Experiment tracking.
+track = ["wandb>=0.19"]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.9"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/obliterated"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

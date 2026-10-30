@@ -1,0 +1,20 @@
+# Models for the reproduction and the main experiments. bf16 sizes; the PC has 24 GB.
+# Llama and Gemma repos are gated: accept the license on Hugging Face and run `hf auth login`.
+
+quick:  # weeks 1-2 iteration, minutes per run on the PC, also fine on the Mac
+  - name: Qwen/Qwen2.5-1.5B-Instruct      # ~3 GB, tied embeddings
+  - name: meta-llama/Llama-3.2-3B-Instruct  # ~6.5 GB, tied embeddings, gated
+  - name: Qwen/Qwen2.5-3B-Instruct
+
+main:  # directions A and B
+  - name: meta-llama/Llama-3.1-8B-Instruct  # ~16 GB, gated
+  - name: Qwen/Qwen2.5-7B-Instruct          # ~15 GB
+  - name: google/gemma-2-9b-it              # ~18.5 GB, tight; post-norms -> use hook ablation
+
+moe:  # Kimi-family stand-in; 8-bit on the PC, bf16 on the Mac
+  - name: moonshotai/Moonlight-16B-A3B-Instruct
+    trust_remote_code: true
+
+judges:
+  default: allenai/wildguard            # refusal + harmfulness labels, gated
+  alt: meta-llama/Llama-Guard-3-8B      # safe/unsafe only, gated

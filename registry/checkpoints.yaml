@@ -1,0 +1,101 @@
+# Public checkpoints for the real-world detection set (direction A, weeks 2-3).
+#
+# STUB: repo ids below are from memory and have NOT been checked against the Hub yet
+# (verified: false). Run `uv run python scripts/verify_registry.py` on the PC and flip
+# `verified` to true for the ones that resolve. Grow this to 20-50 abliterated models plus
+# matched benign fine-tunes; Hurtado (arXiv 2607.01854) lists 273 checkpoints to mine.
+#
+# label:
+#   abliterated            pure refusal-direction edit of `base` (weight diff should be ~rank 1/matrix)
+#   abliterated+finetune   abliterated and then trained further (harder detection case)
+#   benign_finetune        ordinary fine-tune of `base` (negative control for detectors)
+#   base                   the clean reference itself
+#
+# Policy: download for analysis only. Do not re-upload, merge or redistribute these weights.
+
+checkpoints:
+  # ---- Llama 3.2 (1B/3B, tied embeddings) -------------------------------------------------
+  - repo: huihui-ai/Llama-3.2-1B-Instruct-abliterated
+    base: meta-llama/Llama-3.2-1B-Instruct
+    label: abliterated
+    family: llama3.2
+    params_b: 1.2
+    method: huihui-ai abliterator
+  - repo: huihui-ai/Llama-3.2-3B-Instruct-abliterated
+    base: meta-llama/Llama-3.2-3B-Instruct
+    label: abliterated
+    family: llama3.2
+    params_b: 3.2
+    method: huihui-ai abliterator
+
+  # ---- Llama 3 / 3.1 8B --------------------------------------------------------------------
+  - repo: failspy/Meta-Llama-3-8B-Instruct-abliterated-v3
+    base: meta-llama/Meta-Llama-3-8B-Instruct
+    label: abliterated
+    family: llama3
+    params_b: 8.0
+    method: FailSpy abliterator (original community release)
+  - repo: mlabonne/Meta-Llama-3.1-8B-Instruct-abliterated
+    base: meta-llama/Llama-3.1-8B-Instruct
+    label: abliterated
+    family: llama3.1
+    params_b: 8.0
+    method: mlabonne notebook (TransformerLens)
+  - repo: mlabonne/NeuralDaredevil-8B-abliterated
+    base: mlabonne/Daredevil-8B
+    label: abliterated+finetune
+    family: llama3
+    params_b: 8.0
+    method: abliteration followed by DPO "healing"
+    notes: base is itself a merge; diff against Daredevil-8B, not Llama-3-8B-Instruct
+
+  # ---- Qwen 2.5 ----------------------------------------------------------------------------
+  - repo: huihui-ai/Qwen2.5-1.5B-Instruct-abliterated
+    base: Qwen/Qwen2.5-1.5B-Instruct
+    label: abliterated
+    family: qwen2.5
+    params_b: 1.5
+    method: huihui-ai abliterator
+  - repo: huihui-ai/Qwen2.5-3B-Instruct-abliterated
+    base: Qwen/Qwen2.5-3B-Instruct
+    label: abliterated
+    family: qwen2.5
+    params_b: 3.1
+    method: huihui-ai abliterator
+  - repo: huihui-ai/Qwen2.5-7B-Instruct-abliterated-v2
+    base: Qwen/Qwen2.5-7B-Instruct
+    label: abliterated
+    family: qwen2.5
+    params_b: 7.6
+    method: huihui-ai abliterator
+
+  # ---- Gemma 2 (post-sublayer norms: weight edit is approximate) ----------------------------
+  - repo: IlyaGusev/gemma-2-9b-it-abliterated
+    base: google/gemma-2-9b-it
+    label: abliterated
+    family: gemma2
+    params_b: 9.2
+    method: community abliteration
+
+  # ---- Phi-3 -------------------------------------------------------------------------------
+  - repo: failspy/Phi-3-mini-4k-instruct-abliterated-v3
+    base: microsoft/Phi-3-mini-4k-instruct
+    label: abliterated
+    family: phi3
+    params_b: 3.8
+    method: FailSpy abliterator
+    notes: fused qkv/gate_up projections; models.py needs a Phi-3 adapter before local edits
+
+  # ---- Benign fine-tune controls (same instruct base, no refusal edit) ---------------------
+  - repo: VAGOsolutions/Llama-3.1-SauerkrautLM-8b-Instruct
+    base: meta-llama/Llama-3.1-8B-Instruct
+    label: benign_finetune
+    family: llama3.1
+    params_b: 8.0
+    method: German-language SFT/alignment
+  - repo: arcee-ai/Llama-3.1-SuperNova-Lite
+    base: meta-llama/Llama-3.1-8B-Instruct
+    label: benign_finetune
+    family: llama3.1
+    params_b: 8.0
+    method: distillation from a larger teacher

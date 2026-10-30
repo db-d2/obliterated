@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+
+# Downloaded benchmark prompts and everything a run produces stay local.
+# Never commit model completions on harmful prompts or edited weights.
+data/
+runs/
+wandb/
+*.safetensors
+*.bin
