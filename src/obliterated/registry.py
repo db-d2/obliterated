@@ -14,7 +14,7 @@ REGISTRY = Path(__file__).resolve().parents[2] / "registry" / "checkpoints.yaml"
 class Checkpoint:
     repo: str
     base: str
-    label: str  # abliterated | abliterated+finetune | benign_finetune | base
+    label: str  # abliterated | abliterated+finetune | benign_finetune | unlearned | base
     family: str = ""
     params_b: float | None = None
     method: str = ""
