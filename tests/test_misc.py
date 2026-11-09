@@ -22,4 +22,4 @@ def test_sample_is_deterministic():
 def test_registry_parses():
     rows = load_registry()
     assert rows and all(r.repo and r.base for r in rows)
-    assert {r.label for r in rows} <= {"abliterated", "abliterated+finetune", "benign_finetune", "base"}
+    assert {r.label for r in rows} <= {"abliterated", "abliterated+finetune", "benign_finetune", "unlearned", "base"}

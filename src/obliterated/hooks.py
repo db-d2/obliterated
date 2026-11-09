@@ -53,12 +53,23 @@ def hooked(
             h.remove()
 
 
+def orthonormal(directions: Tensor) -> Tensor:
+    """Rows spanning the same subspace as ``directions`` (shape (d,) or (k, d)), orthonormal,
+    shape (k, d). A single direction comes back as its unit vector (up to sign)."""
+    if directions.dim() == 1:
+        return (directions / directions.norm()).float().unsqueeze(0)
+    q, _ = torch.linalg.qr(directions.float().T)
+    return q.T.contiguous()
+
+
 def project_out(direction: Tensor, alpha: float = 1.0) -> Callable[[Tensor], Tensor]:
-    r = direction / direction.norm()
+    """x -> x - alpha * P x, where P projects onto the span of ``direction`` (one vector or a
+    (k, d) stack of them, so a rank-k "concept cone" edit is the same call)."""
+    basis = orthonormal(direction)
 
     def fn(x: Tensor) -> Tensor:
-        rr = r.to(x.device, x.dtype)
-        return x - alpha * (x @ rr).unsqueeze(-1) * rr
+        b = basis.to(x.device, x.dtype)
+        return x - alpha * (x @ b.T) @ b
 
     return fn
 
@@ -76,9 +87,10 @@ def _layers(lm: LM, layers: Sequence[int] | None) -> list[int]:
 
 @contextmanager
 def ablate(lm: LM, direction: Tensor, alpha: float = 1.0, layers: Sequence[int] | None = None):
-    """Directional ablation (Arditi et al.): remove ``direction`` from every residual-stream read
-    and write in ``layers`` (all by default). With alpha=1 and all layers this is exactly
-    equivalent to weight orthogonalization for models without post-sublayer norms."""
+    """Directional ablation (Arditi et al.): remove ``direction`` (a vector, or a (k, d) stack for
+    a subspace) from every residual-stream read and write in ``layers`` (all by default). With
+    alpha=1 and all layers this is exactly equivalent to weight orthogonalization for models
+    without post-sublayer norms."""
     fn = project_out(direction, alpha)
     idx = _layers(lm, layers)
     pre = [(lm.layers[i], fn) for i in idx]

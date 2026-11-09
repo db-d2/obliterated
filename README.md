@@ -87,6 +87,68 @@ orthogonalize(lm, sel.direction)                                         # in-pl
 `alpha < 1` the hook and weight versions are no longer equivalent, since the residual keeps a
 `(1 - alpha)` share at every write and the share compounds differently.
 
+## Directions A, B and D
+
+Everything below runs after the reproduction has produced `runs/<model>/edit.json` (the source
+layer comes from it); without `--edit` each script selects a layer itself.
+
+### A. The detection-limit frontier
+
+```bash
+uv run python scripts/sweep_frontier.py --model Qwen/Qwen2.5-1.5B-Instruct \
+    --edit runs/Qwen__Qwen2.5-1.5B-Instruct/edit.json --ks 1,2,4 --mode hooks
+uv run python scripts/sweep_frontier.py ... --mode weights            # same grid, weight edits
+uv run python scripts/detect_checkpoints.py --family llama3.2 --n 64  # score public checkpoints
+uv run python scripts/sweep_frontier.py ... --negatives runs/detect/checkpoints.jsonl
+```
+
+The attack family is `alpha` x `k` (rank of the removed refusal subspace, from
+`direction.refusal_subspace`, PCA or iterative re-extraction) x layer band (`all`, `mid`,
+`source`, `source±2`) x mode. For every point `sweep.run_sweep` records bypass rate and KL on
+held-out prompts and three detector scores from `detect.py`:
+
+| Detector | What it needs | Score |
+| --- | --- | --- |
+| `weight_top1_energy` | base and candidate weights (or just the edit, computed analytically) | share of the writer-matrix delta's energy in its top singular value, mid-stack mean (1.0 for a pure rank-1 edit) |
+| `activation_gap` | base model's per-layer refusal directions + prompts | 1 - candidate/reference harmful-vs-harmless separation along them |
+| `behaviour_kl_harmful`, `behaviour_refusal_drop` | next-token logits on harmful prompts | KL(base ‖ candidate) and refusal-score drop; the only test that works through an API |
+
+`frontier.png` plots bypass rate against each detector score; with `--negatives` from benign
+fine-tunes in the registry it also draws the 5% false-positive threshold and prints AUROC.
+The paper's question is whether points exist to the right of "refusal gone" and below every
+threshold. `detect_checkpoints.py` streams weight diffs from safetensors and loads base and
+candidate one at a time, so 8B pairs fit on the 24 GB card.
+
+### B. Susceptibility of the clean model
+
+```bash
+uv run python scripts/susceptibility.py --model Qwen/Qwen2.5-1.5B-Instruct \
+    --edit runs/Qwen__Qwen2.5-1.5B-Instruct/edit.json --k-max 4
+```
+
+Writes `runs/<model>/susceptibility.json` with predictors computed before any attack (stable
+rank, effective rank, participation ratio and dim90 of the refusal residuals at the source
+layer; the signal's relative size and how many layers carry it; a linear probe's accuracy,
+margin and alignment with the mean difference) and the empirical target: the refusal-score
+drop of the best rank-k edit whose harmless KL stays under `--kl-budget`. Run it across the
+models in `configs/models.yaml` and across defended variants, then correlate.
+
+### D. Refusal ablation as an unlearning attack
+
+No new code: extract a direction from the unlearned model and score knowledge with WMDP.
+
+```bash
+uv run python scripts/reproduce_refusal_direction.py --model cais/Zephyr_RMU
+uv run --extra eval python scripts/capability_eval.py --model cais/Zephyr_RMU --limit 500
+uv run --extra eval python scripts/capability_eval.py --model cais/Zephyr_RMU --limit 500 \
+    --edit runs/cais__Zephyr_RMU/edit.json
+uv run python scripts/susceptibility.py --model cais/Zephyr_RMU --edit runs/cais__Zephyr_RMU/edit.json
+```
+
+The difference in `wmdp_cyber` accuracy between the two `capability_eval` runs is the recovered
+knowledge; the question for the paper is whether B's susceptibility score predicts it. The
+registry has an `unlearned` label for these checkpoints (unverified ids, like the rest).
+
 ## Layout
 
 ```
@@ -94,12 +156,15 @@ src/obliterated/
   device.py      CUDA / MPS / CPU selection
   data.py        prompt-set loaders with local caching and overlap removal
   models.py      loading, chat formatting, residual-stream module access (dense + MoE)
-  hooks.py       directional ablation, activation addition, residual caching
-  direction.py   difference-in-means candidates and Arditi-style selection
-  edits.py       weight orthogonalization and EditSpec
+  hooks.py       directional (rank-1 or rank-k) ablation, activation addition, residual caching
+  direction.py   difference-in-means candidates, Arditi-style selection, refusal subspaces
+  edits.py       weight orthogonalization, EditSpec, snapshot/restore for reversible edits
   refusal.py     logit refusal score, substring matcher, KL
   generate.py    batched greedy generation
   judge.py       WildGuard and Llama Guard 3 wrappers
+  detect.py      A: weight-diff spectrum, activation gap, behaviour shift, AUROC
+  susceptibility.py  B: spectral predictors, linear probe, worst-case rank-k drop
+  sweep.py       A: the attack grid, JSONL rows, frontier plot
   registry.py    public checkpoint registry
 scripts/         end-to-end entry points (above)
 configs/         model list and lm-eval tasks
@@ -129,9 +194,9 @@ From the scoping doc ("Model obliteration: research scoping", 30 Oct 2026).
 | Weeks | Goal | Output |
 | --- | --- | --- |
 | 1-2 | Reproduce Arditi et al. on 1-3B models, then Llama-3.1-8B, Qwen2.5-7B, Gemma-2-9B | refusal (judge) and MMLU/GSM8K for baseline, ablation, orthogonalization |
-| 2-3 | Attack family: strength alpha, number of directions k, layer band; hook and weight versions. Fill the registry with 20-50 public abliterated checkpoints plus benign fine-tunes | parameterized edits; verified registry |
-| 3-5 | Detector battery: weight-diff spectral energy, activation gap along reference directions, logprob test. Plot attack success against AUROC for each setting | the detection-limit frontier (direction A's headline) |
-| 4-6 | Susceptibility predictors on clean models: stable rank, cone dimension, probe margin; check they predict the measured drop | direction B's empirical result |
+| 2-3 | Attack family: strength alpha, number of directions k, layer band; hook and weight versions (`sweep.py`, done). Fill the registry with 20-50 public abliterated checkpoints plus benign fine-tunes | parameterized edits; verified registry |
+| 3-5 | Detector battery: weight-diff spectral energy, activation gap along reference directions, logprob test (`detect.py`, done). Plot attack success against AUROC for each setting | the detection-limit frontier (direction A's headline) |
+| 4-6 | Susceptibility predictors on clean models: stable rank, cone dimension, probe margin (`susceptibility.py`, done); check they predict the measured drop | direction B's empirical result |
 | 6-8 | Detector-aware attacker and the conditional bound under linear readout | evasion boundary; theory section |
 
 Target: SoLaR, ATTRIB or MechInterp workshop at NeurIPS/ICLR for the frontier result. Direction

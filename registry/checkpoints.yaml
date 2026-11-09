@@ -9,6 +9,7 @@
 #   abliterated            pure refusal-direction edit of `base` (weight diff should be ~rank 1/matrix)
 #   abliterated+finetune   abliterated and then trained further (harder detection case)
 #   benign_finetune        ordinary fine-tune of `base` (negative control for detectors)
+#   unlearned              an unlearning method applied to `base` (direction D; scored with WMDP)
 #   base                   the clean reference itself
 #
 # Policy: download for analysis only. Do not re-upload, merge or redistribute these weights.
@@ -99,3 +100,14 @@ checkpoints:
     family: llama3.1
     params_b: 8.0
     method: distillation from a larger teacher
+
+  # ---- Direction D: unlearned checkpoints (does refusal-subspace ablation restore WMDP?) ----
+  # Score with scripts/capability_eval.py on wmdp_cyber before and after an edit extracted
+  # from the unlearned model itself (see README, "Direction D").
+  - repo: cais/Zephyr_RMU
+    base: HuggingFaceH4/zephyr-7b-beta
+    label: unlearned
+    family: zephyr
+    params_b: 7.2
+    method: RMU on WMDP-Bio and WMDP-Cyber forget sets (Li et al. 2024)
+    notes: the official WMDP release; Mistral-7B architecture, no post-norms
