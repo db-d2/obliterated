@@ -1,0 +1,15 @@
+# Capability evals run by scripts/capability_eval.py through lm-evaluation-harness.
+# Task names are lm-eval's built-ins (check with `lm_eval --tasks list`).
+
+tasks:
+  - name: mmlu
+    num_fewshot: 5
+  - name: gsm8k
+    num_fewshot: 5
+  # Knowledge proxy for the cyber domain (direction D). Multiple choice only; no generation.
+  - name: wmdp_cyber
+    num_fewshot: 0
+
+batch_size: auto
+# Set to e.g. 200 for a quick smoke run; null runs the full tasks.
+limit: null
