@@ -5,7 +5,7 @@ import hashlib
 import pytest
 import torch
 
-from obliterated import judge
+from obliterated import device, judge
 
 
 def test_the_grader_prompt_is_the_published_one():
@@ -65,3 +65,22 @@ def test_an_adapter_is_named_with_the_model_it_sits_on(tmp_path):
 
 def test_a_judge_that_is_not_cached_has_no_revision_to_name(tmp_path):
     assert judge.stamp("lab/judge", cache=tmp_path) == "lab/judge@unknown"
+
+
+def test_release_empties_the_allocator_cache_of_the_device_in_use(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.mps, "empty_cache", lambda: calls.append("mps"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("cuda"))
+    for kind in ("mps", "cuda", "cpu"):
+        device.release(torch.device(kind))
+    assert calls == ["mps", "cuda"]
+
+
+def test_judging_releases_cached_gpu_memory_after_every_batch(monkeypatch):
+    """Batches differ in shape, and MPS keeps the buffers of every shape it has seen: a 5 GB
+    grader held 13.5 GB after three batches, and a run over 91 checkpoints never let go."""
+    released = []
+    monkeypatch.setattr(judge, "release", released.append)
+    seen = [(part.start, part.stop, len(released)) for part in judge.batches(20, 8, torch.device("cpu"), "judge")]
+    assert seen == [(0, 8, 0), (8, 16, 1), (16, 24, 2)]  # released once each batch is done
+    assert len(released) == 3                            # and after the last one
