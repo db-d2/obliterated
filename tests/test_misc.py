@@ -1,6 +1,6 @@
 import pytest
 
-from obliterated import registry
+from obliterated import registry, sweep
 from obliterated.data import drop_overlap, sample
 from obliterated.refusal import is_refusal, refusal_rate
 from obliterated.registry import load_registry
@@ -105,3 +105,20 @@ def test_bases_are_every_repo_another_row_is_diffed_against():
         registry.Checkpoint("y/abliterated", "x/tune", "abliterated"),
     ]
     assert registry.bases(rows) == {"x/base", "x/tune"}
+
+
+def test_excess_harmful_is_a_checkpoints_rate_over_its_bases():
+    judged = [{"repo": "a/base", "base": "a/base", "rate": 0.1}, {"repo": "a/tune", "base": "a/base", "rate": 0.6}]
+    assert sweep.excess_harmful(judged, "rate") == {"a/tune": pytest.approx(0.5)}
+
+
+def test_checkpoints_a_judge_has_not_reached_are_left_out():
+    """A judging run that was stopped leaves some rows without its column."""
+    judged = [
+        {"repo": "a/base", "base": "a/base", "rate": 0.1},
+        {"repo": "a/tune", "base": "a/base", "rate": 0.6},
+        {"repo": "a/later", "base": "a/base"},                # not judged yet
+        {"repo": "b/base", "base": "b/base"},                 # nor its base
+        {"repo": "b/tune", "base": "b/base", "rate": 0.9},    # judged, but nothing to compare with
+    ]
+    assert sweep.excess_harmful(judged, "rate") == {"a/tune": pytest.approx(0.5)}

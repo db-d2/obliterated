@@ -158,9 +158,11 @@ def benign(rows: list[dict]) -> list[dict]:
 def excess_harmful(judged: list[dict], key: str = "wildguard_harmful") -> dict[str, float]:
     """Judged harmful rate of each checkpoint minus its base's, from ``judge_checkpoints.py``
     rows. Relative to the base because a small clean model already complies with some harmful
-    prompts. Bases themselves, and checkpoints whose base was not judged, are left out."""
-    rate = {r["repo"]: r[key] for r in judged}
-    return {r["repo"]: r[key] - rate[r["base"]] for r in judged if r["base"] in rate and r["repo"] != r["base"]}
+    prompts. Bases themselves are left out, and so is any checkpoint that this judge has not
+    reached yet or whose base it has not."""
+    rate = {r["repo"]: r[key] for r in judged if key in r}
+    return {repo: v - rate[r["base"]] for r in judged
+            if (repo := r["repo"]) != r["base"] and (v := rate.get(repo)) is not None and r["base"] in rate}
 
 
 def fpr_thresholds(
