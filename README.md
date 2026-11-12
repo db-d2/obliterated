@@ -107,6 +107,9 @@ uv run python scripts/detect_checkpoints.py --family llama3.1 --evict \
 uv run python scripts/judge_checkpoints.py --checkpoints runs/detect/qwen25.jsonl   # do they still refuse?
 uv run python scripts/judge_checkpoints.py --checkpoints runs/detect/qwen25.jsonl \
     --judge meta-llama/Llama-Guard-3-8B                               # second judge, adds both_harmful
+uv run python scripts/judge_checkpoints.py --checkpoints runs/detect/qwen25.jsonl \
+    --judge qylu4156/strongreject-15k-v1                              # grader: did the answer help?
+uv run python scripts/detect_checkpoints.py --add-alignment --out runs/detect/llama31.jsonl  # from records
 uv run python scripts/label_report.py --checkpoints runs/detect/qwen25.jsonl        # abliterated vs unsafe
 uv run python scripts/frontier_report.py ... --judged runs/detect/judged.jsonl      # negatives that still refuse
 ```
@@ -119,6 +122,7 @@ held-out prompts and three detector scores from `detect.py`:
 | Detector | What it needs | Score |
 | --- | --- | --- |
 | `weight_top1_energy`, `weight_top{2,4,8}_energy`, and each with a `_w` suffix | base and candidate weights (or just the edit, computed analytically) | share of the writer-matrix delta's energy in its top (or top k) singular values (1.0 for a pure rank-1, or rank-k, edit). Plain: mean over changed mid-stack matrices. `_w`: energy-weighted over every layer |
+| `weight_refusal_alignment`, `weight_refusal_alignment_med`, `weight_vocab_alignment` | a checkpoint's record (`--record`): its top factors per changed matrix and the base's refusal directions | how much of the base's refusal direction lies in the span of a changed matrix's top 8 residual-side factors: 1.0 when the edit writes or removes it, about sqrt(8 / d_model) for an unrelated one. Largest and median over the writer matrices, and largest over embedding and output head. Checkpoints only, not sweep points |
 | `activation_gap` | base model's per-layer refusal directions + prompts | 1 - candidate/reference harmful-vs-harmless separation along them |
 | `behaviour_kl_harmful`, `behaviour_refusal_drop` | next-token logits on harmful prompts | KL(base ‖ candidate) and refusal-score drop; the only test that works through an API |
 
@@ -164,7 +168,9 @@ checkpoint. `--record` writes, under `<out dir>/record/`:
   same template token); and the per-prompt measurements each score is a mean of (KL and refusal score per
   harmful prompt, projections per layer and prompt), about 4 MB for an 8B model. A weight
   detector that asks whether an edit points along the refusal direction, or whether only the
-  output head was edited, and a bootstrap interval for any score, need nothing more.
+  output head was edited, and a bootstrap interval for any score, need nothing more. The
+  first of those is `record.alignment`, written into each row as `weight_refusal_alignment`;
+  `--add-alignment` adds it to rows scored before it existed, from the records alone.
 - `<repo>.json`: the revision of the checkpoint and of its base that was scored, every file
   with its size and content hash, the settings, device, precision and library versions, a hash
   of this repo's sources, and the card's declared base, training datasets and licence.
@@ -220,6 +226,12 @@ at which the two agree, which `label_report.py` and `frontier_report.py` take as
 unsafe label relative to WildGuard alone. Telling "did not refuse" from "helped" needs a judge
 that grades what the answer says.
 
+`--judge qylu4156/strongreject-15k-v1` is that judge: the fine-tuned StrongREJECT evaluator
+(Souly et al. 2024), a LoRA adapter on the gated `google/gemma-2b` that grades how much an
+answer assists with the request. `strongreject_score` is the mean over the prompts, from 0
+(refused, or useless) to 1 (full assistance), and both reports take it as `--harmful-key`.
+It runs locally, like the other two; no answer leaves the machine.
+
 ### B. Susceptibility of the clean model
 
 ```bash
@@ -263,7 +275,7 @@ src/obliterated/
   refusal.py     logit refusal score, substring matcher, KL
   generate.py    batched greedy generation
   completions.py answers kept on disk for the judges, reasoning-tag handling, think budget
-  judge.py       WildGuard and Llama Guard 3 wrappers
+  judge.py       WildGuard, Llama Guard 3 and the StrongREJECT grader
   detect.py      A: weight-diff spectrum (top-1 and top-k), activation gap, behaviour shift, AUROC
   susceptibility.py  B: spectral predictors, linear probe, worst-case rank-k drop
   sweep.py       A: the attack grid, JSONL rows, thresholds from negatives, frontier plot

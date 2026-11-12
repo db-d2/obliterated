@@ -170,6 +170,26 @@ def top_factors(delta: Tensor, k: int = 8) -> tuple[Tensor, Tensor]:
     return evals[top].clamp_min(0).sqrt().float(), evecs[:, top].float()
 
 
+def refusal_alignment(factors: Tensor, directions: Tensor) -> float:
+    """How much of the base's refusal direction lies inside the span of an edit's top factors.
+
+    ``factors`` is (d_model, k) with orthonormal columns: the residual-side singular vectors
+    ``top_factors`` keeps for one changed matrix. ``directions`` is (L, d_model), the base's
+    refusal direction per layer. Returns the largest cosine, over layers, between a direction
+    and its projection onto the span: 1.0 when the edit writes or removes that direction,
+    about sqrt(k / d_model) for an unrelated one. The span is used, not the top factor alone,
+    because a rank-k edit is free to rotate its basis. Layers with no direction are skipped.
+
+    This is the weight detector that survives a dense change on top of the edit, where the
+    energy share of the top singular values does not."""
+    directions = directions.float()
+    norms = directions.norm(dim=1)
+    if not bool((norms > 0).any()):
+        return 0.0
+    unit = directions[norms > 0] / norms[norms > 0, None]
+    return float((unit @ factors.float()).norm(dim=1).max())
+
+
 def frobenius(delta: Tensor) -> float:
     """Frobenius norm of ``delta``, accumulated in float64 a slice of columns at a time.
 

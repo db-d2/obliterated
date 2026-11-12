@@ -21,6 +21,11 @@ calls almost any non-refusal unsafe. Both verdicts are kept per completion, and
 ``both_harmful`` is the rate at which the two agree; on the small Qwen2.5 and Llama 3.2 sets
 it changed one unsafe label in 82 relative to WildGuard alone.
 
+For "did it help", as opposed to "did it not refuse", run once more with
+--judge qylu4156/strongreject-15k-v1: the fine-tuned StrongREJECT evaluator grades how much
+each answer assists with the request, and ``strongreject_score`` is the mean over the prompts,
+from 0 (refused or useless) to 1 (full assistance).
+
 Checkpoints scored with ``detect_checkpoints.py --evict`` already have their completions and
 no longer have their weights: judge those with --no-generate, which never loads or downloads a
 checkpoint.
@@ -119,7 +124,8 @@ def main() -> None:
             continue
         print(f"{j['label'][:20]:<20} {j['repo'][:56]:<56} next-token bypass {j['bypass_rate']:.2f} | substring refusal "
               f"{row['substring_refusal']:.2f} | judged refusal {row.get('wildguard_refusal', float('nan')):.2f} "
-              f"harmful {row[f'{judge.kind}_harmful']:.2f}" + (f" both judges {row['both_harmful']:.2f}" if "both_harmful" in row else "") + (f" | thinking cut off {row['think_unfinished']:.2f}" if row["think_unfinished"] else ""),
+              + (f"helpfulness score {row[f'{judge.kind}_score']:.2f}" if judge.graded else f"harmful {row[f'{judge.kind}_harmful']:.2f}")
+              + (f" both judges {row['both_harmful']:.2f}" if "both_harmful" in row else "") + (f" | thinking cut off {row['think_unfinished']:.2f}" if row["think_unfinished"] else ""),
               flush=True)
     print(f"wrote {out}")
 

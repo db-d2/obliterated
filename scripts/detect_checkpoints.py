@@ -19,6 +19,11 @@ weights again. --rescore-weights recomputes only the weight fields of the rows a
 (no model is loaded) and refreshes their labels from the registry. Weights are downloaded for
 analysis only.
 
+With --record a row also carries weight_refusal_alignment (and _med, and weight_vocab_alignment):
+how much of the base's refusal direction lies in the span of a changed matrix's top factors.
+It finds an abliteration under a dense change that hides it from the energy shares.
+--add-alignment computes it for rows scored before it existed, from their records alone.
+
 When the disk cannot hold a whole set (thirty 8B fine-tunes are about 480 GB), score each
 checkpoint and delete it:
 
@@ -64,6 +69,7 @@ from pathlib import Path
 
 import torch
 from huggingface_hub import ModelCard, constants, hf_hub_download
+from safetensors.torch import load_file
 
 from obliterated import completions, data, detect, direction, record, sweep
 from obliterated.models import load, unload
@@ -228,6 +234,26 @@ def rescore_weights(out: Path) -> None:
     tmp.replace(out)
 
 
+def add_alignment(out: Path) -> None:
+    """Give every row in ``out`` that has a record its refusal-alignment scores. Only the
+    record files are read, so this works after the weights are gone. A scoring run appends to
+    the same file: if it changed while this ran, nothing is written."""
+    before = out.read_text()
+    rows = sweep.read_rows(out)
+    done = 0
+    for r in rows:
+        saved = record.tensors_path(out, r["repo"])
+        if saved.exists():
+            r.update(record.alignment(load_file(saved)))
+            done += 1
+    if out.read_text() != before:
+        raise SystemExit(f"{out} changed while this ran (is a scoring run writing to it?); nothing written")
+    tmp = out.with_suffix(".tmp")
+    sweep.write_rows(rows, tmp)
+    tmp.replace(out)
+    print(f"{done} of {len(rows)} rows have a record and now carry {', '.join(record.ALIGNMENT)}")
+
+
 def summary(out: Path) -> None:
     scored = sweep.read_rows(out)
     pos = [r for r in scored if r["label"].startswith("abliterated")]
@@ -283,6 +309,8 @@ def score(c, ref: dict, args) -> dict:
         row.update(weight_fields(c, ref["n_layers"], Path(args.out), kept, snapshot))
     if kept is not None:
         kept["reference.directions"] = ref["ref_dirs"].half()
+        if not args.skip_weights:
+            row.update(record.alignment(kept))
         kept.update({f"behaviour.{k}": v for k, v in per_prompt.items()})
         kept["activation.harmful"], kept["activation.harmless"] = proj
         kept["activation.harmful_base"], kept["activation.harmless_base"] = ref["proj"]
@@ -305,6 +333,8 @@ def main() -> None:
     ap.add_argument("--redo", action="store_true", help="rescore repos already present in --out")
     ap.add_argument("--rescore-weights", action="store_true",
                     help="recompute the weight fields and labels of the rows in --out, then exit")
+    ap.add_argument("--add-alignment", action="store_true",
+                    help="add the refusal-alignment scores to the rows in --out from their saved records, then exit")
     ap.add_argument("--completions", action="store_true",
                     help="also write each checkpoint's answers to JailbreakBench, for judge_checkpoints.py")
     ap.add_argument("--n-jbb", type=int, default=100, help="JailbreakBench prompts for --completions")
@@ -340,6 +370,10 @@ def main() -> None:
         raise SystemExit(1 if bad else 0)
     if args.rescore_weights:
         rescore_weights(Path(args.out))
+        summary(Path(args.out))
+        return
+    if args.add_alignment:
+        add_alignment(Path(args.out))
         summary(Path(args.out))
         return
 

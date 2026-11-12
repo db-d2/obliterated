@@ -223,3 +223,42 @@ def test_weight_spectrum_reports_the_true_norm_of_a_large_difference():
     assert m["fro_norm"] == pytest.approx(exact, rel=1e-6)
     top = float(detect.top_factors(delta, 1)[0][0])
     assert math.sqrt(m["top1_energy"]) * m["fro_norm"] == pytest.approx(top, rel=1e-5)
+
+
+def _basis(d: int = 16) -> torch.Tensor:
+    """An orthonormal basis to build factors and directions from by hand."""
+    return torch.linalg.qr(torch.randn(d, d, generator=torch.Generator().manual_seed(3)))[0]
+
+
+def test_an_edit_along_the_refusal_direction_aligns_fully():
+    q = _basis()
+    directions = torch.stack([q[:, 5], q[:, 9]])       # two layers' refusal directions
+    factors = q[:, [9, 0, 1]]                          # the edit's top factor is the second one
+    assert detect.refusal_alignment(factors, directions) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_a_direction_split_across_two_factors_still_aligns_fully():
+    """A rank-2 edit can rotate its basis so that no single factor is the refusal direction."""
+    q = _basis()
+    mixed = torch.stack([(q[:, 5] + q[:, 6]) / 2**0.5, (q[:, 5] - q[:, 6]) / 2**0.5], dim=1)
+    assert float((mixed[:, 0] @ q[:, 5]).abs()) == pytest.approx(2**-0.5, abs=1e-5)
+    assert detect.refusal_alignment(mixed, q[:, 5][None]) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_an_unrelated_edit_does_not_align():
+    q = _basis()
+    assert detect.refusal_alignment(q[:, [0, 1, 2]], torch.stack([q[:, 5], q[:, 9]])) == pytest.approx(0.0, abs=1e-5)
+
+
+def test_alignment_is_a_cosine_whatever_the_length_of_the_directions():
+    q = _basis()
+    partly = (0.6 * q[:, 5] + 0.8 * q[:, 7])[:, None]  # 0.6 of it lies along layer 0's direction below
+    assert detect.refusal_alignment(partly, 40.0 * q[:, 5][None]) == pytest.approx(0.6, abs=1e-5)
+
+
+def test_a_layer_without_a_direction_is_skipped():
+    """At layer 0 every prompt ends in the same template token, so the direction saved there is zero."""
+    q = _basis()
+    directions = torch.stack([torch.zeros(16), q[:, 5]])
+    assert detect.refusal_alignment(q[:, [5]], directions) == pytest.approx(1.0, abs=1e-5)
+    assert detect.refusal_alignment(q[:, [5]], torch.zeros(2, 16)) == 0.0

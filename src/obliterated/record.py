@@ -23,6 +23,7 @@ import json
 import math
 import os
 import re
+import statistics
 from pathlib import Path
 
 import torch
@@ -76,6 +77,33 @@ def write(out: str | Path, repo: str, tensors: dict[str, torch.Tensor], provenan
     path.parent.mkdir(parents=True, exist_ok=True)
     save_file({k: v.detach().cpu().contiguous() for k, v in tensors.items()}, path)
     provenance_path(out, repo).write_text(json.dumps(provenance, indent=1))
+
+
+ALIGNMENT = ("weight_refusal_alignment", "weight_refusal_alignment_med", "weight_vocab_alignment")
+
+
+def alignment(kept: dict[str, torch.Tensor]) -> dict[str, float]:
+    """Refusal-direction alignment of a checkpoint, from its record tensors alone.
+
+    For every changed matrix the record holds its top residual-side factors, and it holds the
+    base's refusal direction per layer; ``detect.refusal_alignment`` compares the two.
+    ``weight_refusal_alignment`` is the largest value over the writer matrices: one aligned
+    matrix is evidence, and an edit confined to a few layers under an unrelated fine-tune
+    still shows. ``weight_refusal_alignment_med`` is their median, which an edit applied
+    throughout the stack moves and a chance alignment does not. ``weight_vocab_alignment`` is
+    the largest over the embedding and the output head, where an edit of the head alone lives.
+    All are 0.0 when nothing of that kind changed."""
+    directions = kept["reference.directions"]
+    writers, vocab = [], []
+    for key, factors in kept.items():
+        if key.endswith(".u"):
+            group = writers if detect.layer_of(key.removesuffix(".u")) is not None else vocab
+            group.append(detect.refusal_alignment(factors, directions))
+    return {
+        "weight_refusal_alignment": max(writers, default=0.0),
+        "weight_refusal_alignment_med": statistics.median(writers) if writers else 0.0,
+        "weight_vocab_alignment": max(vocab, default=0.0),
+    }
 
 
 def _close(a: float, b: float, tol: float = 1e-4) -> bool:
@@ -165,6 +193,9 @@ def validate(row: dict, out: str | Path, prompts: list[str], weights: bool = Tru
             elif not _same(float(s[0]), math.sqrt(m["top1_energy"]) * m["fro_norm"]):
                 problems.append(f"{m['name']}: saved top singular value {float(s[0]):.5g} disagrees with the "
                                 f"spectrum ({math.sqrt(m['top1_energy']) * m['fro_norm']:.5g})")
+        for key, value in alignment(kept).items():
+            if key in row and not _close(row[key], value):
+                problems.append(f"{key}: the row says {row[key]:.5f}, the saved factors give {value:.5f}")
         for key in kept:  # the embedding and the output head: a norm, and the factors beside it
             name = key.removesuffix(".fro")
             if name != key and f"{name}.s" in kept:

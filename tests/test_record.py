@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from obliterated import completions, detect, record
+from obliterated import completions, detect, record, sweep
 
 REPO, BASE = "someone/tune", "lab/base"
 REV = "0123456789abcdef0123456789abcdef01234567"
@@ -254,6 +254,56 @@ def test_any_other_undefined_weight_score_is_a_problem_even_for_a_null_control(t
     assert _flagged(_problems(tmp_path, parts), "weight_top1_energy_w")
 
 
+def _aligned() -> dict:
+    """Record tensors with hand-made factors: three writer matrices and the embedding, against
+    four layers whose refusal directions are the first four axes of a 6-dimensional stream."""
+    e = torch.eye(6)
+    factors = {
+        "model.layers.0.mlp.down_proj.weight": e[:, [4, 5]],                         # unrelated: 0
+        "model.layers.1.self_attn.o_proj.weight": e[:, [1]],                         # layer 1's direction: 1
+        "model.layers.2.mlp.down_proj.weight": (0.6 * e[:, 2] + 0.8 * e[:, 5])[:, None],  # 0.6 of layer 2's
+        detect.EMBEDDING: e[:, [3]],                                                 # the embedding: 1
+    }
+    kept = {"reference.directions": torch.eye(4, 6).half()}
+    for name, u in factors.items():
+        kept |= {f"{name}.u": u.half(), f"{name}.s": torch.ones(u.shape[1])}
+    return kept
+
+
+def test_alignment_summarises_the_writer_matrices_and_reports_the_vocabulary_apart():
+    scores = record.alignment(_aligned())
+    assert scores["weight_refusal_alignment"] == pytest.approx(1.0, abs=1e-3)
+    assert scores["weight_refusal_alignment_med"] == pytest.approx(0.6, abs=1e-3)
+    assert scores["weight_vocab_alignment"] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_a_writer_edit_does_not_count_as_a_vocabulary_edit_or_the_reverse():
+    kept = _aligned()
+    del kept[f"{detect.EMBEDDING}.u"], kept[f"{detect.EMBEDDING}.s"]
+    assert record.alignment(kept)["weight_vocab_alignment"] == 0.0
+    only_vocab = {k: v for k, v in _aligned().items() if not k.startswith("model.layers.")}
+    scores = record.alignment(only_vocab)
+    assert (scores["weight_refusal_alignment"], scores["weight_refusal_alignment_med"]) == (0.0, 0.0)
+    assert scores["weight_vocab_alignment"] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_a_checkpoint_that_changed_nothing_aligns_with_nothing():
+    assert record.alignment({"reference.directions": torch.eye(4, 6).half()}) == {
+        "weight_refusal_alignment": 0.0, "weight_refusal_alignment_med": 0.0, "weight_vocab_alignment": 0.0}
+
+
+def test_a_row_whose_alignment_the_record_reproduces_validates(tmp_path):
+    parts = _parts()
+    parts["row"] |= record.alignment(parts["tensors"])
+    assert _problems(tmp_path, parts) == []
+
+
+def test_an_alignment_the_record_does_not_reproduce_is_a_problem(tmp_path):
+    parts = _parts()
+    parts["row"] |= record.alignment(parts["tensors"]) | {"weight_refusal_alignment_med": 0.123}
+    assert _flagged(_problems(tmp_path, parts), "weight_refusal_alignment_med")
+
+
 def _script(name: str):
     path = Path(__file__).resolve().parents[1] / "scripts" / f"{name}.py"
     spec = importlib.util.spec_from_file_location(name, path)
@@ -269,3 +319,37 @@ def test_the_code_version_is_taken_once_per_process(monkeypatch):
     first = script.versions()
     monkeypatch.setattr(script.hashlib, "sha256", lambda *_: pytest.fail("the sources were hashed a second time"))
     assert script.versions() == first
+
+
+def _scored(tmp_path) -> Path:
+    """A results file with one row that has a record and one, scored earlier, that has none."""
+    out = tmp_path / "scores.jsonl"
+    record.write(out, REPO, _aligned(), {"repo": REPO})
+    sweep.write_rows([{"repo": REPO, "label": "abliterated"}, {"repo": "someone/older", "label": "benign_finetune"}], out)
+    return out
+
+
+def test_alignment_is_added_to_the_rows_that_have_a_record(tmp_path):
+    out = _scored(tmp_path)
+    _script("detect_checkpoints").add_alignment(out)
+    with_record, without = sweep.read_rows(out)
+    assert with_record["weight_refusal_alignment_med"] == pytest.approx(0.6, abs=1e-3)
+    assert without == {"repo": "someone/older", "label": "benign_finetune"}
+
+
+def test_a_results_file_that_grew_meanwhile_is_not_overwritten(tmp_path, monkeypatch):
+    """A scoring run appends to the same file; rewriting it from a stale read would drop a row."""
+    out = _scored(tmp_path)
+    script = _script("detect_checkpoints")
+    real = record.alignment
+
+    def a_live_run_appends(kept):
+        sweep.write_rows([{"repo": "someone/new", "label": "benign_finetune"}], out)
+        return real(kept)
+
+    monkeypatch.setattr(script.record, "alignment", a_live_run_appends)
+    with pytest.raises(SystemExit):
+        script.add_alignment(out)
+    rows = sweep.read_rows(out)
+    assert [r["repo"] for r in rows] == [REPO, "someone/older", "someone/new"]
+    assert "weight_refusal_alignment" not in rows[0]

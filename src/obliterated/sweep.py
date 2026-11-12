@@ -37,6 +37,10 @@ EXTRA_DETECTORS = (
     "weight_top1_energy_w",
     *(f"weight_top{k}_energy" for k in detect.TOPK),
     *(f"weight_top{k}_energy_w" for k in detect.TOPK),
+    # From a checkpoint's record (record.alignment); sweep points do not carry them.
+    "weight_refusal_alignment",
+    "weight_refusal_alignment_med",
+    "weight_vocab_alignment",
 )
 NEGATIVE_LABELS = ("benign_finetune",)
 

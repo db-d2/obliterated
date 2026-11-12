@@ -139,3 +139,53 @@ def test_a_checkpoint_with_no_saved_answers_is_reported_and_not_judged(tmp_path)
     judge = _Judge()
     assert list(completions.judge_all({"a/gone": _job("a/gone")}, judge, out)) == [(_job("a/gone"), None)]
     assert judge.seen == []
+
+
+class _Grader:
+    """Stands in for a rubric grader: a score per answer instead of a harmful/safe label."""
+
+    kind, graded = "strongreject", True
+
+    def __init__(self, scores: dict[str, float]):
+        self.scores, self.seen = scores, []
+
+    def __call__(self, prompts, responses, batch_size=8):
+        self.seen.append(list(responses))
+        return [Verdict(None, None, "", score=self.scores[r]) for r in responses]
+
+
+def test_a_grader_adds_its_mean_score_and_leaves_the_classifiers_columns_alone(tmp_path):
+    out = tmp_path / "judged.jsonl"
+    _answers(out, "a/tune", ["Sure, step one", "Voici la traduction"],
+             wildguard_refusal=[False, False], wildguard_harmful=[True, True])
+    completions.save([_job("a/tune") | {"wildguard_harmful": 1.0, "wildguard_refusal": 0.0}], out)
+    grader = _Grader({"Sure, step one": 0.75, "Voici la traduction": 0.0})
+    [(_, row)] = completions.judge_all({"a/tune": _job("a/tune")}, grader, out)
+    assert row["strongreject_score"] == 0.375
+    assert (row["wildguard_harmful"], row["wildguard_refusal"]) == (1.0, 0.0)
+    assert "strongreject_harmful" not in row and "both_harmful" not in row
+    assert [c["strongreject_score"] for c in sweep.read_rows(completions.path(out, "a/tune"))] == [0.75, 0.0]
+
+
+def test_answers_a_grader_has_scored_are_not_graded_again(tmp_path):
+    out = tmp_path / "judged.jsonl"
+    _answers(out, "a/tune", ["Sure, step one"], strongreject_score=[0.5])
+    grader = _Grader({})
+    [(_, row)] = completions.judge_all({"a/tune": _job("a/tune")}, grader, out)
+    assert grader.seen == [] and row["strongreject_score"] == 0.5
+
+
+def test_a_row_names_the_judge_that_produced_its_numbers(tmp_path):
+    out = tmp_path / "judged.jsonl"
+    _answers(out, "a/tune", ["Sure, step one"])
+    grader = _Grader({"Sure, step one": 0.5})
+    grader.stamp = "lab/grader@aaa111 on big/base@bbb222"
+    [(_, row)] = completions.judge_all({"a/tune": _job("a/tune")}, grader, out)
+    assert row["strongreject_judge"] == "lab/grader@aaa111 on big/base@bbb222"
+
+
+def test_a_judge_with_no_name_leaves_no_empty_column(tmp_path):
+    out = tmp_path / "judged.jsonl"
+    _answers(out, "a/tune", ["Sure, step one"])
+    [(_, row)] = completions.judge_all({"a/tune": _job("a/tune")}, _Judge(), out)
+    assert "llamaguard_judge" not in row

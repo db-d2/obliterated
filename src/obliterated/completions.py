@@ -88,18 +88,21 @@ def record(
     return used
 
 
-def rates(comps: list[dict], tag: str) -> dict:
+def rates(comps: list[dict], tag: str, graded: bool = False) -> dict:
     """What one checkpoint's judged answers come to: the columns of its results row that the
-    judge ``tag`` is responsible for, and the rate both judges agree on once both have run."""
+    judge ``tag`` is responsible for, and the rate both classifiers agree on once both have
+    run. A grader contributes the mean of its scores; a classifier, the share it calls harmful."""
     n = len(comps)
     row = {
         "dataset": "jailbreakbench", "n": n, "tokenizer": comps[0]["tokenizer"],
         "max_new_tokens": comps[0]["max_new_tokens"],
         "substring_refusal": refusal_rate([answer(c["completion"]) for c in comps]),
         "think_unfinished": sum(cut_off(c["completion"]) for c in comps) / n,
-        f"{tag}_harmful": sum(bool(c[f"{tag}_harmful"]) for c in comps) / n,
-        f"{tag}_unparsed": sum(c[f"{tag}_harmful"] is None for c in comps) / n,
     }
+    if graded:
+        return row | {f"{tag}_score": sum(c[f"{tag}_score"] for c in comps) / n}
+    row[f"{tag}_harmful"] = sum(bool(c[f"{tag}_harmful"]) for c in comps) / n
+    row[f"{tag}_unparsed"] = sum(c[f"{tag}_harmful"] is None for c in comps) / n
     if tag == "wildguard":
         row["wildguard_refusal"] = sum(bool(c["wildguard_refusal"]) for c in comps) / n
     if all("wildguard_harmful" in c and "llamaguard_harmful" in c for c in comps):
@@ -117,7 +120,8 @@ def judge_all(
     Verdicts go into the answer files and rows into ``out`` checkpoint by checkpoint, so a run
     that is stopped keeps what it finished, and a rerun judges only what is missing."""
     out = Path(out)
-    tag = judge.kind
+    tag, graded = judge.kind, getattr(judge, "graded", False)
+    mark = f"{tag}_score" if graded else f"{tag}_harmful"  # the field that says an answer was judged
     merged = {r["repo"]: r for r in read_rows(out)} if out.exists() else {}
     for job in jobs.values():
         file = path(out, job["repo"])
@@ -125,11 +129,15 @@ def judge_all(
             yield job, None
             continue
         comps = read_rows(file)
-        if any(f"{tag}_harmful" not in c for c in comps):
+        if any(mark not in c for c in comps):
             verdicts = judge([c["prompt"] for c in comps], [answer(c["completion"]) for c in comps], batch_size)
             for c, v in zip(comps, verdicts):
-                c[f"{tag}_refusal"], c[f"{tag}_harmful"] = v.refusal, v.harmful_response
+                if graded:
+                    c[mark] = v.score
+                else:
+                    c[f"{tag}_refusal"], c[f"{tag}_harmful"] = v.refusal, v.harmful_response
             save(comps, file)
-        row = merged[job["repo"]] = merged.get(job["repo"], {}) | job | rates(comps, tag)
+        named = {f"{tag}_judge": judge.stamp} if getattr(judge, "stamp", None) else {}
+        row = merged[job["repo"]] = merged.get(job["repo"], {}) | job | rates(comps, tag, graded) | named
         save(list(merged.values()), out)
         yield job, row

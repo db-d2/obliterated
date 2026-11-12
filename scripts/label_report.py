@@ -23,8 +23,8 @@ import pandas as pd
 
 from obliterated import detect, sweep
 
-SCORES = ("weight_top1_energy_w", "weight_top8_energy_w", "activation_gap",
-          "behaviour_kl_harmful", "behaviour_refusal_drop", "bypass_rate")
+SCORES = ("weight_top1_energy_w", "weight_top8_energy_w", "weight_refusal_alignment", "weight_refusal_alignment_med",
+          "activation_gap", "behaviour_kl_harmful", "behaviour_refusal_drop", "bypass_rate")
 
 
 def auroc(pos: list[dict], neg: list[dict], key: str) -> float:
@@ -62,14 +62,16 @@ def main() -> None:
             print(f"  {r['label']:<20} {r['repo']:<58} harmful +{r['excess_harmful']:.2f} over base")
 
     report = {"n": len(rows), "margin": args.margin, "harmful_key": args.harmful_key, "unsafe": [r["repo"] for r in unsafe], "scores": {}}
-    print(f"\n{'score':<24} {'AUROC abliterated':>18} {'AUROC unsafe':>13} {'rank corr. with harmful':>24}")
+    print(f"\n{'score':<29} {'AUROC abliterated':>18} {'AUROC unsafe':>13} {'rank corr. with harmful':>24} {'n':>4}")
     for key in SCORES:
         have = [r for r in rows if key in r and r[key] == r[key]]
+        if not have:  # e.g. the alignment scores, for rows scored without a record
+            continue
         # Spearman as Pearson on ranks: pandas' own method="spearman" needs scipy.
         rho = pd.Series([r[key] for r in have]).rank().corr(pd.Series([r["excess_harmful"] for r in have]).rank())
         stats = {"auroc_abliterated": auroc(edited, benign, key), "auroc_unsafe": auroc(unsafe, safe, key), "spearman": rho}
         report["scores"][key] = stats
-        print(f"{key:<24} {stats['auroc_abliterated']:>18.3f} {stats['auroc_unsafe']:>13.3f} {rho:>24.3f}")
+        print(f"{key:<29} {stats['auroc_abliterated']:>18.3f} {stats['auroc_unsafe']:>13.3f} {rho:>24.3f} {len(have):>4}")
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=1))
 
