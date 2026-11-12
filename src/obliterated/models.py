@@ -8,6 +8,7 @@ DeepSeek-V3-style MoE such as Moonlight (every expert's ``down_proj`` is a resid
 
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass, field
 
 import torch
@@ -115,13 +116,27 @@ def load(
     device: str | None = None,
     dtype: torch.dtype | None = None,
     system_prompt: str | None = None,
+    tokenizer: PreTrainedTokenizer | None = None,
     **kwargs,
 ) -> LM:
+    """``tokenizer`` overrides the checkpoint's own tokenizer and chat template. Pass the base
+    model's when auditing a fine-tune, so a changed template or default system prompt does not
+    show up as a change in behaviour."""
     dev = best_device(device)
     dtype = dtype or default_dtype(dev)
-    tok = AutoTokenizer.from_pretrained(name)
+    tok = tokenizer or AutoTokenizer.from_pretrained(name)
     model = AutoModelForCausalLM.from_pretrained(name, dtype=dtype, **kwargs).to(dev).eval()
     return wrap(model, tok, name=name, system_prompt=system_prompt)
+
+
+def unload(lm: LM) -> None:
+    """Drop the weights and hand the memory back, before the next model is loaded."""
+    del lm.model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 
 def wrap(model: PreTrainedModel, tokenizer: PreTrainedTokenizer, **kwargs) -> LM:

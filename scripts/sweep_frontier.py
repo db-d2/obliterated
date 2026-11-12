@@ -81,13 +81,10 @@ def main() -> None:
 
     thresholds = None
     if args.negatives:
-        neg = sweep.read_rows(args.negatives)
-        thresholds = {}
-        for det in sweep.DETECTORS:
-            vals = sorted(r[det] for r in neg if det in r)
-            if vals:
-                thresholds[det] = vals[min(len(vals) - 1, int(0.95 * len(vals)))]
-                print(f"{det}: AUROC {sweep.frontier_auroc(rows, neg, det):.3f}")
+        neg = sweep.benign(sweep.read_rows(args.negatives))
+        thresholds = sweep.fpr_thresholds(neg)
+        for det in thresholds:
+            print(f"{det}: AUROC {sweep.frontier_auroc(rows, neg, det):.3f}")
     sweep.plot_frontier(sweep.read_rows(out / "frontier.jsonl"), out / "frontier.png", thresholds)
     for r in rows:
         print(

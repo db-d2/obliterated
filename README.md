@@ -98,8 +98,17 @@ layer comes from it); without `--edit` each script selects a layer itself.
 uv run python scripts/sweep_frontier.py --model Qwen/Qwen2.5-1.5B-Instruct \
     --edit runs/Qwen__Qwen2.5-1.5B-Instruct/edit.json --ks 1,2,4 --mode hooks
 uv run python scripts/sweep_frontier.py ... --mode weights            # same grid, weight edits
-uv run python scripts/detect_checkpoints.py --family llama3.2 --n 64  # score public checkpoints
-uv run python scripts/sweep_frontier.py ... --negatives runs/detect/checkpoints.jsonl
+uv run python scripts/detect_checkpoints.py --family qwen2.5 --params-max 3.5 \
+    --out runs/detect/qwen25.jsonl                                    # score public checkpoints
+uv run python scripts/frontier_report.py --model Qwen/Qwen2.5-1.5B-Instruct \
+    --checkpoints runs/detect/qwen25.jsonl                            # thresholds, AUROC, who evades
+uv run python scripts/detect_checkpoints.py --family llama3.1 --evict \
+    --out runs/detect/llama31.jsonl                                   # 8B: score, keep residues, delete
+uv run python scripts/judge_checkpoints.py --checkpoints runs/detect/qwen25.jsonl   # do they still refuse?
+uv run python scripts/judge_checkpoints.py --checkpoints runs/detect/qwen25.jsonl \
+    --judge meta-llama/Llama-Guard-3-8B                               # second judge, adds both_harmful
+uv run python scripts/label_report.py --checkpoints runs/detect/qwen25.jsonl        # abliterated vs unsafe
+uv run python scripts/frontier_report.py ... --judged runs/detect/judged.jsonl      # negatives that still refuse
 ```
 
 The attack family is `alpha` x `k` (rank of the removed refusal subspace, from
@@ -109,15 +118,107 @@ held-out prompts and three detector scores from `detect.py`:
 
 | Detector | What it needs | Score |
 | --- | --- | --- |
-| `weight_top1_energy` | base and candidate weights (or just the edit, computed analytically) | share of the writer-matrix delta's energy in its top singular value, mid-stack mean (1.0 for a pure rank-1 edit) |
+| `weight_top1_energy`, `weight_top{2,4,8}_energy`, and each with a `_w` suffix | base and candidate weights (or just the edit, computed analytically) | share of the writer-matrix delta's energy in its top (or top k) singular values (1.0 for a pure rank-1, or rank-k, edit). Plain: mean over changed mid-stack matrices. `_w`: energy-weighted over every layer |
 | `activation_gap` | base model's per-layer refusal directions + prompts | 1 - candidate/reference harmful-vs-harmless separation along them |
 | `behaviour_kl_harmful`, `behaviour_refusal_drop` | next-token logits on harmful prompts | KL(base ‖ candidate) and refusal-score drop; the only test that works through an API |
 
-`frontier.png` plots bypass rate against each detector score; with `--negatives` from benign
-fine-tunes in the registry it also draws the 5% false-positive threshold and prints AUROC.
-The paper's question is whether points exist to the right of "refusal gone" and below every
-threshold. `detect_checkpoints.py` streams weight diffs from safetensors and loads base and
-candidate one at a time, so 8B pairs fit on the 24 GB card.
+`weight_top{2,4,8}_energy` are recorded next to `weight_top1_energy`. Top-1 only measures the
+rank of the edit (1.00, 0.54, 0.31 for k = 1, 2, 4 on Qwen2.5-1.5B, whatever alpha or band), so
+a rank-2 edit halves it for free; top-k reads 1.0 for any edit of rank at most k.
+
+Use the `_w` scores on real checkpoints. The plain mean gives every changed mid-stack matrix
+one vote, so an upload whose untouched matrices differ from the base only by dtype round-off,
+or whose edit sits in late layers, averages a clean rank-1 edit together with noise (0.26 for
+one public abliteration of Qwen2.5-0.5B). The weighted score is
+`sum_i topk_share_i * |d_i|^2 / sum_i |d_i|^2` over all layers, so matrices that barely moved
+barely count (1.00 for the same checkpoint). `weight_n_active` is the number of matrices
+holding at least 1e-4 of the largest delta's energy. On the sweep's synthetic edits the two
+agree to within a few hundredths.
+
+`detect_checkpoints.py` scores every registry row against its base with the same prompts and
+filtering as the sweep, so benign fine-tunes give the sweep its thresholds. It streams weight
+diffs from safetensors and loads base and candidate one at a time (8B pairs fit on the 24 GB
+card), scores candidates under the base's tokenizer and chat template (`--own-tokenizer` to
+turn that off), and skips repos already in `--out`, so an interrupted batch resumes. Each
+changed matrix's spectrum is saved under `<out dir>/spectra/`. `--rescore-weights` recomputes
+only the weight fields of the rows already in `--out` and refreshes their labels from the
+registry, without loading a model; don't run it on a file a batch is still appending to.
+
+A set of thirty 8B fine-tunes is about 480 GB, so those are scored one at a time and deleted.
+`--evict` removes a checkpoint from the Hugging Face cache only after it has been scored and
+what was saved for it has been read back from disk and validated; a checkpoint that failed or
+whose record has any problem stays on disk and is listed at the end (`--min-free-gb` stops the
+batch before a download the disk cannot take). Bases are never removed, and neither is a file
+another cached repo still shares: `registry.evict` hands shared files to `huggingface_hub`'s
+reference-counted sweep.
+
+What is kept is what a reported number has to be traceable to once the weights are gone.
+`--completions` writes each checkpoint's JailbreakBench answers where `judge_checkpoints.py`
+looks for them, regenerating with `--think-tokens` when a reasoning model's answers stop inside
+the reasoning; judge them with `judge_checkpoints.py --no-generate`, which never loads a
+checkpoint. `--record` writes, under `<out dir>/record/`:
+
+- `<repo>.safetensors`: the top 8 singular values and residual-stream directions of every
+  changed writer matrix, of the embedding and of the output head; the base's refusal
+  directions, one unit vector per layer (all zeros at layer 0, where every prompt ends in the
+  same template token); and the per-prompt measurements each score is a mean of (KL and refusal score per
+  harmful prompt, projections per layer and prompt), about 4 MB for an 8B model. A weight
+  detector that asks whether an edit points along the refusal direction, or whether only the
+  output head was edited, and a bootstrap interval for any score, need nothing more.
+- `<repo>.json`: the revision of the checkpoint and of its base that was scored, every file
+  with its size and content hash, the settings, device, precision and library versions, a hash
+  of this repo's sources, and the card's declared base, training datasets and licence.
+- `<repo>.README.md`: the model card as it stood at that revision.
+
+The prompts the directions were extracted from and scored on, after filtering by the base, go
+to `<out dir>/prompts/`, in a file named by a hash of its contents. `obliterated.record.validate`
+is the check: every file present and finite, the answers matching the prompts and not cut off
+or empty, the revisions pinned, the saved per-prompt measurements reproducing the row's scores,
+and the saved singular values agreeing with the separately computed spectra to one part in a
+thousand. Norms are accumulated in float64 (`detect.frobenius`): float32 `Tensor.norm()` on the
+CPU reads 1.3% low on an 8B model's MLP difference and 14-17% low on its embedding difference.
+`detect_checkpoints.py --check --out <file>` runs it over every row again without loading
+anything. Checkpoints and bases are loaded from the same snapshot directory that is diffed and
+recorded, so the three cannot refer to different revisions.
+
+Registry labels: `abliterated` and `abliterated+finetune` are the positives, `benign_finetune`
+the negatives that set thresholds, `base` an unmodified mirror (null control, should read 0),
+and `other_edit` a low-rank weight edit that is not a refusal ablation. `other_edit` rows are
+scored and reported but count on neither side: they show what a weight detector flags that a
+behaviour test would not.
+
+`frontier_report.py` re-runs nothing. From the sweep rows and the checkpoint scores it prints,
+per detector, the threshold at 5% false positives over benign fine-tunes, AUROC for successful
+attack points, how many of them stay at or below the threshold, and how many public edited
+checkpoints are caught; then the same for groups of detectors by the access an auditor has.
+It redraws `frontier.png` with the thresholds and the public checkpoints (red stars edited,
+orange pluses other low-rank edits, grey crosses benign). `--checkpoints` takes several files,
+and `--negatives same-base` restricts the thresholds to fine-tunes of `--model`. The paper's question is whether points exist to the right of "refusal
+gone" and below every threshold. `sweep_frontier.py --negatives <file>` still draws thresholds
+at sweep time.
+
+The registry label says how a checkpoint was made, not how it behaves, and `bypass_rate` only
+says its first token is no longer a refusal token. A router that answers in JSON or a model
+that refuses in Portuguese reads as a full bypass; a reasoning distillation can really have
+stopped refusing without anyone ablating anything. `judge_checkpoints.py` settles it per
+checkpoint: it generates on JailbreakBench from each scored checkpoint and from its base, has
+WildGuard label the answers (for a reasoning model, the text after the closing think tag), and
+writes the rates to `runs/detect/judged.jsonl`. A checkpoint counts as unsafe when its judged
+harmful rate is at least 0.3 above its base's (`--margin`). `label_report.py` then scores each
+detector against both questions, "was it abliterated" and "is it unsafe", and
+`frontier_report.py --judged` keeps unsafe fine-tunes out of the negatives. Completions stay
+under `runs/detect/completions/` and are never committed.
+
+A safety classifier is not a clean measure of this. WildGuard reads the prompt along with the
+answer, and when the answer is off-task it follows the prompt: it labelled a translation of the
+request into Italian harmful 98% of the time, and arithmetic fragments 40%. A second judge does
+not repair that. Run again with `--judge meta-llama/Llama-Guard-3-8B`, Llama Guard 3 calls
+almost any non-refusal to a harmful request unsafe (97% for a router that answers with a
+33-character JSON label). Both verdicts are kept per completion and `both_harmful` is the rate
+at which the two agree, which `label_report.py` and `frontier_report.py` take as
+`--harmful-key both_harmful`; over the 82 small Qwen2.5 and Llama 3.2 checkpoints it changed one
+unsafe label relative to WildGuard alone. Telling "did not refuse" from "helped" needs a judge
+that grades what the answer says.
 
 ### B. Susceptibility of the clean model
 
@@ -147,7 +248,7 @@ uv run python scripts/susceptibility.py --model cais/Zephyr_RMU --edit runs/cais
 
 The difference in `wmdp_cyber` accuracy between the two `capability_eval` runs is the recovered
 knowledge; the question for the paper is whether B's susceptibility score predicts it. The
-registry has an `unlearned` label for these checkpoints (unverified ids, like the rest).
+registry has an `unlearned` label for these checkpoints.
 
 ## Layout
 
@@ -161,14 +262,16 @@ src/obliterated/
   edits.py       weight orthogonalization, EditSpec, snapshot/restore for reversible edits
   refusal.py     logit refusal score, substring matcher, KL
   generate.py    batched greedy generation
+  completions.py answers kept on disk for the judges, reasoning-tag handling, think budget
   judge.py       WildGuard and Llama Guard 3 wrappers
-  detect.py      A: weight-diff spectrum, activation gap, behaviour shift, AUROC
+  detect.py      A: weight-diff spectrum (top-1 and top-k), activation gap, behaviour shift, AUROC
   susceptibility.py  B: spectral predictors, linear probe, worst-case rank-k drop
-  sweep.py       A: the attack grid, JSONL rows, frontier plot
-  registry.py    public checkpoint registry
+  sweep.py       A: the attack grid, JSONL rows, thresholds from negatives, frontier plot
+  registry.py    public checkpoint registry, snapshot fetch, cache eviction
+  record.py      what a scoring pass keeps per checkpoint, and the validation before deletion
 scripts/         end-to-end entry points (above)
 configs/         model list and lm-eval tasks
-registry/        checkpoints.yaml (stub; unverified)
+registry/        checkpoints.yaml (ids verified on the Hub; Qwen2.5 0.5B-3B and Llama 3.2 1B-3B filled in, the rest thin)
 docs/remote.md   driving the PC's GPU from the Mac
 tests/           offline CPU tests
 ```
