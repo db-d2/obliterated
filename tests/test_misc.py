@@ -1,7 +1,10 @@
+import copy
+
 import pytest
 
 from obliterated import registry, sweep
 from obliterated.data import drop_overlap, sample
+from obliterated.models import wrap
 from obliterated.refusal import is_refusal, refusal_rate
 from obliterated.registry import load_registry
 
@@ -122,3 +125,15 @@ def test_checkpoints_a_judge_has_not_reached_are_left_out():
         {"repo": "b/tune", "base": "b/base", "rate": 0.9},    # judged, but nothing to compare with
     ]
     assert sweep.excess_harmful(judged, "rate") == {"a/tune": pytest.approx(0.5)}
+
+
+DATED_TEMPLATE = (  # the part of Llama 3.2's chat template that reads the clock
+    "{% if not date_string is defined %}{% set date_string = strftime_now('%d %b %Y') %}{% endif %}"
+    "<bos> Today Date: {{ date_string }} {% for m in messages %}<|{{ m['role'] }}|> {{ m['content'] }} {% endfor %}"
+)
+
+
+def test_a_prompt_does_not_carry_the_day_it_was_formatted_on(tokenizer):
+    tok = copy.deepcopy(tokenizer)
+    tok.chat_template = DATED_TEMPLATE
+    assert wrap(None, tok).format("bake a cake") == "<bos> Today Date: 26 Jul 2024 <|user|> bake a cake "

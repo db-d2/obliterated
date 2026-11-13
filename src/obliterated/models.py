@@ -18,6 +18,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, P
 from .device import best_device, default_dtype
 
 _PLACEHOLDER = "<<<INSTRUCTION>>>"
+# Llama 3.2's chat template writes the current date into the system header unless it is given
+# one, so the same checkpoint scores differently from one day to the next. This is the date the
+# template itself falls back on and the one Llama 3.1's template always uses. Templates that
+# have no date line ignore it.
+TEMPLATE_DATE = "26 Jul 2024"
 
 
 @dataclass
@@ -89,7 +94,7 @@ class LM:
         if self.system_prompt is not None:
             msgs.append({"role": "system", "content": self.system_prompt})
         msgs.append({"role": "user", "content": instruction})
-        return self.tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        return self.tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, date_string=TEMPLATE_DATE)
 
     @property
     def eoi_len(self) -> int:

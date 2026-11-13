@@ -300,6 +300,11 @@ tests/           offline CPU tests
 - **Qwen's default system prompt.** Qwen 2.5's chat template inserts "You are Qwen..." when no
   system prompt is given. Pass `system_prompt=` to `load` to control it, and keep it fixed across
   conditions.
+- **Llama 3.2's dated system header.** Its chat template writes "Today Date:" with the current
+  date into every prompt unless it is given one, which moved a 1B fine-tune's KL from 25.3 to
+  26.6 between two consecutive days. `LM.format` passes the fixed `models.TEMPLATE_DATE`
+  ("26 Jul 2024", the template's own fallback and what Llama 3.1 always uses). Llama 3.1, Qwen
+  2.5 and Gemma 2 prompts do not depend on it.
 - **Phi-3** uses fused projections and is not supported by `models.py` yet.
 
 ## Eight-week plan
