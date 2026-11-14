@@ -126,10 +126,16 @@ def load(
 ) -> LM:
     """``tokenizer`` overrides the checkpoint's own tokenizer and chat template. Pass the base
     model's when auditing a fine-tune, so a changed template or default system prompt does not
-    show up as a change in behaviour."""
+    show up as a change in behaviour.
+
+    The attention kernel is the library's default unless ``attn_implementation`` is passed,
+    whatever the checkpoint's config asks for: a fine-tune saved with flash attention switched
+    on would otherwise fail to load without that CUDA-only package, and a candidate should
+    run on the same kernel as its base."""
     dev = best_device(device)
     dtype = dtype or default_dtype(dev)
     tok = tokenizer or AutoTokenizer.from_pretrained(name)
+    kwargs.setdefault("attn_implementation", None)
     model = AutoModelForCausalLM.from_pretrained(name, dtype=dtype, **kwargs).to(dev).eval()
     return wrap(model, tok, name=name, system_prompt=system_prompt)
 

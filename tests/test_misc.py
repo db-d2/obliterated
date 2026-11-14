@@ -1,12 +1,17 @@
 import copy
+import json
 
 import pytest
+import torch
+from transformers import AutoModelForCausalLM
 
 from obliterated import registry, sweep
 from obliterated.data import drop_overlap, sample
-from obliterated.models import wrap
+from obliterated.models import load, wrap
 from obliterated.refusal import is_refusal, refusal_rate
 from obliterated.registry import load_registry
+
+from .conftest import CONFIGS
 
 
 def test_refusal_matcher():
@@ -137,3 +142,13 @@ def test_a_prompt_does_not_carry_the_day_it_was_formatted_on(tokenizer):
     tok = copy.deepcopy(tokenizer)
     tok.chat_template = DATED_TEMPLATE
     assert wrap(None, tok).format("bake a cake") == "<bos> Today Date: 26 Jul 2024 <|user|> bake a cake "
+
+
+def test_load_does_not_let_a_checkpoint_choose_its_attention_kernel(tmp_path, tokenizer):
+    """A fine-tune's config can ask for flash attention, a package that only exists for CUDA.
+    The loader picks the kernel, so such a checkpoint loads the same way as its base."""
+    AutoModelForCausalLM.from_config(CONFIGS["qwen2_bias"](), dtype=torch.float32).save_pretrained(tmp_path)
+    config = json.loads((tmp_path / "config.json").read_text())
+    (tmp_path / "config.json").write_text(json.dumps({**config, "attn_implementation": "flash_attention_2"}))
+    lm = load(str(tmp_path), device="cpu", dtype=torch.float32, tokenizer=tokenizer)
+    assert lm.model.config._attn_implementation in ("sdpa", "eager")
