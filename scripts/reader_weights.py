@@ -46,13 +46,11 @@ import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 
-import torch
 from huggingface_hub import constants
-from huggingface_hub.file_download import repo_folder_name
 from safetensors.torch import load_file
 
-from obliterated import detect, record, sweep
-from obliterated.registry import bases, evict, fetch, load_registry
+from obliterated import record, sweep
+from obliterated.registry import bases, evict, fetch, load_registry, snapshot_folder
 
 N_FACTORS = 8
 
@@ -62,10 +60,6 @@ def versions() -> dict:
     """Taken once per process: the sources on disk at the end of a long run need not be the
     ones that were loaded."""
     return record.code_versions(Path(__file__))
-
-
-def snapshot_folder(repo: str, revision: str) -> Path:
-    return Path(constants.HF_HUB_CACHE) / repo_folder_name(repo_id=repo, repo_type="model") / "snapshots" / revision
 
 
 def cached(repo: str, revision: str, files: list[dict]) -> bool:
@@ -99,48 +93,20 @@ def score(main_row: dict, main_out: str | Path, out: str | Path) -> dict:
     main = pinned(main_out, repo)
     base_dir = locate(base, main["base_revision"], main["base_files"])
     cand_dir = locate(repo, main["revision"], main["files"])
-    n_layers = json.loads((base_dir / "config.json").read_text())["num_hidden_layers"]
-    kept = {"reference.directions": load_file(record.tensors_path(main_out, repo))["reference.directions"]}
-    spectra, matrices, missing, gains = [], [], [], []
-    for m in detect.scan_readers(base_dir, cand_dir, kept["reference.directions"].float(), N_FACTORS):
-        if m.get("missing") or not m["finite"]:
-            missing.append(m["name"])
-            continue
-        matrices.append(m["name"])
-        kept[f"{m['name']}.read"] = torch.stack([m["read_base"], m["read_cand"]]).float()
-        kept.setdefault(f"gain.{m['norm']}", m["gain"])
-        if m["gain_changed"]:
-            gains.append(m["name"])
-            kept[f"gain_cand.{m['norm']}"] = m["gain_cand"]
-        if m["changed"]:
-            kept[f"{m['name']}.s"], kept[f"{m['name']}.u"] = m["s"], m["u"].half()
-        if "eu" in m:
-            kept[f"{m['name']}.es"], kept[f"{m['name']}.eu"] = m["es"], m["eu"].half()
-            spectra.append({"name": m["name"], "stored": m.get("summary"), "effective": m["summary_eff"]})
-    mid = detect.mid_layers(n_layers)
-    in_layers = [s for s in spectra if detect.layer_of(s["name"]) is not None]
-    fields = detect.scores_from_spectra([s["stored"] for s in in_layers if s["stored"]], mid)
-    fields.pop("per_matrix")
-    effective = detect.scores_from_spectra([s["effective"] for s in in_layers], mid)
+    read = record.read_readers(base_dir, cand_dir, load_file(record.tensors_path(main_out, repo))["reference.directions"], N_FACTORS)
     info, base_info = record.snapshot_info(cand_dir), record.snapshot_info(base_dir)
-    row = {
-        "repo": repo, "base": base, "label": main_row.get("label"), "family": main_row.get("family"),
-        "params_b": main_row.get("params_b"), "revision": info["revision"],
-        **{k.replace("weight_", "reader_", 1): v for k, v in fields.items()},
-        **{k.replace("weight_", "reader_eff_", 1): v for k, v in effective.items() if k.endswith("_energy_w")},
-        **record.reader_scores(kept),  # from what is kept, at the precision it is kept in
-        "reader_n_gain_changed": len(gains),
-        "reader_head_changed": any(s["name"] == detect.HEAD and bool(s["stored"]) for s in spectra),
-    }
+    row = {"repo": repo, "base": base, "label": main_row.get("label"), "family": main_row.get("family"),
+           "params_b": main_row.get("params_b"), "revision": info["revision"], **read["fields"]}
     path = record.spectra_path(out, repo)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(spectra))
-    record.write(out, repo, kept, {
+    path.write_text(json.dumps(read["spectra"]))
+    record.write(out, repo, read["kept"], {
         "repo": repo, "base": base, "label": main_row.get("label"),
         "revision": info["revision"], "files": info["files"],
         "base_revision": base_info["revision"], "base_files": base_info["files"],
         "main_record": str(record.tensors_path(main_out, repo)),
-        "n_layers": n_layers, "n_factors": N_FACTORS, "matrices": matrices, "missing": missing, "gain_changed": gains,
+        "n_layers": read["n_layers"], "n_factors": N_FACTORS, "matrices": read["matrices"], "missing": read["missing"],
+        "gain_changed": read["gain_changed"],
         "scored_at": datetime.now(UTC).isoformat(timespec="seconds"), "versions": versions(),
     })
     return row

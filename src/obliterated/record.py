@@ -166,6 +166,51 @@ def reader_scores(kept: dict[str, torch.Tensor]) -> dict[str, float]:
     }
 
 
+def read_readers(base_dir: str | Path, cand_dir: str | Path, directions: torch.Tensor, k: int = 8) -> dict:
+    """The reading matrices of the weights in ``cand_dir`` against those in ``base_dir``
+    (``detect.scan_readers``), as the reader pass keeps and reports them, whether the
+    candidate is an uploaded checkpoint or an edit of the base made here:
+
+    - ``kept``: the tensors of the record, ``directions`` among them as given
+    - ``spectra``: per changed matrix, the spectrum summary of the stored matrix's change and
+      of the change in the matrix composed with its norm
+    - ``matrices`` read, those ``missing`` (absent, of another shape, or not finite) and those
+      whose ``gain_changed``, by name, and ``n_layers``
+    - ``fields``: the reader_* fields of the candidate's row"""
+    n_layers = json.loads((Path(base_dir) / "config.json").read_text())["num_hidden_layers"]
+    kept = {"reference.directions": directions}
+    spectra, matrices, missing, gains = [], [], [], []
+    for m in detect.scan_readers(base_dir, cand_dir, directions.float(), k):
+        if m.get("missing") or not m["finite"]:
+            missing.append(m["name"])
+            continue
+        matrices.append(m["name"])
+        kept[f"{m['name']}.read"] = torch.stack([m["read_base"], m["read_cand"]]).float()
+        kept.setdefault(f"gain.{m['norm']}", m["gain"])
+        if m["gain_changed"]:
+            gains.append(m["name"])
+            kept[f"gain_cand.{m['norm']}"] = m["gain_cand"]
+        if m["changed"]:
+            kept[f"{m['name']}.s"], kept[f"{m['name']}.u"] = m["s"], m["u"].half()
+        if "eu" in m:
+            kept[f"{m['name']}.es"], kept[f"{m['name']}.eu"] = m["es"], m["eu"].half()
+            spectra.append({"name": m["name"], "stored": m.get("summary"), "effective": m["summary_eff"]})
+    mid = detect.mid_layers(n_layers)
+    in_layers = [s for s in spectra if detect.layer_of(s["name"]) is not None]
+    stored = detect.scores_from_spectra([s["stored"] for s in in_layers if s["stored"]], mid)
+    stored.pop("per_matrix")
+    effective = detect.scores_from_spectra([s["effective"] for s in in_layers], mid)
+    fields = {
+        **{key.replace("weight_", "reader_", 1): v for key, v in stored.items()},
+        **{key.replace("weight_", "reader_eff_", 1): v for key, v in effective.items() if key.endswith("_energy_w")},
+        **reader_scores(kept),  # from what is kept, at the precision it is kept in
+        "reader_n_gain_changed": len(gains),
+        "reader_head_changed": any(s["name"] == detect.HEAD and bool(s["stored"]) for s in spectra),
+    }
+    return {"kept": kept, "spectra": spectra, "matrices": matrices, "missing": missing, "gain_changed": gains,
+            "n_layers": n_layers, "fields": fields}
+
+
 def code_versions(script: Path) -> dict:
     """The code and libraries behind a score: the commit, whether anything was uncommitted, a
     hash of the sources that produce the scores (the commit alone does not identify them while

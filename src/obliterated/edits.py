@@ -9,7 +9,9 @@ which is how the sweep runner tries many weight-mode edits on one loaded model.
 
 from __future__ import annotations
 
+import itertools
 import json
+import shutil
 import warnings
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -200,6 +202,66 @@ def blind_readers(lm: LM, direction: torch.Tensor, alpha: float = 1.0, layers: l
         w = lin.weight.data.float()
         w -= alpha * ((w * g) @ b.T) @ (b * inv)
         lin.weight.data.copy_(w.to(lin.weight.dtype))
+
+
+def _gain_on_disk(stored: torch.Tensor, gemma: bool, eps: float) -> torch.Tensor:
+    """``norm_gain`` without the module: what the norm makes of a vector of ones, in the
+    module's own arithmetic. The norm divides the ones by sqrt(1 + eps) in float32; Gemma
+    multiplies that by one plus its weight and then rounds to the stored precision, the others
+    round it first and multiply by the weight."""
+    unit = torch.rsqrt(torch.tensor(1.0) + eps)
+    if gemma:
+        return ((1.0 + stored.float()) * unit).to(stored.dtype).float()
+    return (stored * unit.to(stored.dtype)).float()
+
+
+@torch.no_grad()
+def blind_readers_on_disk(
+    base_dir: str | Path, out_dir: str | Path, direction: torch.Tensor, alpha: float = 1.0, layers: list[int] | None = None
+) -> Path:
+    """``blind_readers`` from a snapshot's files to files, without loading a model: the
+    reading matrices the edited model would have, bit for bit, in the precision the base
+    stores them in.
+
+    Written to ``out_dir``: every reading matrix of the base (edited inside ``layers``, copied
+    outside them; the output head always under its own name, edited when the last layer is),
+    the norms in front of them and the config. That is all ``detect.scan_readers`` reads, and
+    nothing a model could be loaded from: no writer matrix and no embedding. One file per
+    layer, so no more than a layer's readers is held at a time."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    from . import detect  # which imports this module
+
+    base_dir, out_dir = Path(base_dir), Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    config = json.loads((base_dir / "config.json").read_text())
+    n_layers = config["num_hidden_layers"]
+    # a config file leaves out what is at its default; 1e-6 is the default of all three families
+    gemma, eps = config.get("model_type", "").startswith("gemma"), config.get("rms_norm_eps", 1e-6)
+    index = detect._tensor_index(base_dir)
+    edited = set(range(n_layers) if layers is None else layers)
+    basis = hooks.orthonormal(direction)
+
+    def stored(name: str) -> torch.Tensor:
+        with safe_open(index[name], "pt") as f:
+            return f.get_tensor(name)
+
+    for layer, group in itertools.groupby(detect.reader_layout(index), key=lambda m: detect.layer_of(m[0])):
+        tensors = {}
+        for name, norm in group:
+            w = stored(name if name in index else detect.EMBEDDING)  # a tied head is the embedding
+            tensors[norm] = stored(norm)
+            if (n_layers - 1 if layer is None else layer) in edited:  # the head reads the last layer's output
+                g = _gain_on_disk(tensors[norm], gemma, eps)
+                inv = torch.where(g.abs() > 1e-6, 1.0 / g, torch.zeros_like(g))
+                x = w.float()
+                x -= alpha * ((x * g) @ basis.T) @ (basis * inv)
+                w = x.to(w.dtype)
+            tensors[name] = w
+        save_file(tensors, out_dir / ("head.safetensors" if layer is None else f"layer_{layer:03d}.safetensors"))
+    shutil.copyfile(base_dir / "config.json", out_dir / "config.json")
+    return out_dir
 
 
 @contextmanager

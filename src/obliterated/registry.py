@@ -44,6 +44,14 @@ def fetch(repo: str, revision: str | None = None) -> Path:
     return Path(snapshot_download(repo, revision=revision, allow_patterns=want))
 
 
+def snapshot_folder(repo: str, revision: str) -> Path:
+    """Where the Hugging Face cache keeps ``repo`` at ``revision``, downloaded or not."""
+    from huggingface_hub import constants
+    from huggingface_hub.file_download import repo_folder_name
+
+    return Path(constants.HF_HUB_CACHE) / repo_folder_name(repo_id=repo, repo_type="model") / "snapshots" / revision
+
+
 def bases(checkpoints: Iterable[Checkpoint]) -> set[str]:
     """Every repo another row is diffed against. These have to stay on disk."""
     return {c.base for c in checkpoints}
