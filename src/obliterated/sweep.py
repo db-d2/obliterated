@@ -27,7 +27,7 @@ import torch
 from tqdm.auto import tqdm
 
 from . import detect, hooks
-from .edits import EditSpec, temporarily_orthogonalized
+from .edits import EditSpec, temporarily_blinded, temporarily_orthogonalized
 from .models import LM
 from .refusal import kl_div, last_logits, refusal_score_from_logits
 
@@ -78,9 +78,14 @@ def run_sweep(
     tag: str = "",
 ) -> list[dict]:
     """One row per (alpha, k, band). ``subspace`` is (K, d) with orthonormal rows, first row the
-    difference-in-means direction; ``ks`` must not exceed K. ``ref_directions`` are the clean
+    difference-in-means direction; ``ks`` must not exceed K. ``mode`` is "hooks" (runtime
+    ablation), "weights" (the writer matrices are orthogonalized) or "readers" (the writers are
+    left alone and the matrices that read the stream are changed). ``ref_directions`` are the clean
     model's per-layer unit refusal directions (``detect.reference_directions``); computed here
     from the validation prompts if omitted."""
+    if mode not in ("hooks", "weights", "readers"):
+        raise ValueError(f"mode must be 'hooks', 'weights' or 'readers', not {mode!r}")
+    edit = {"hooks": hooks.ablate, "weights": temporarily_orthogonalized, "readers": temporarily_blinded}[mode]
     bands = bands or layer_bands(lm.n_layers)
     detect_layers = detect_layers or detect.mid_layers(lm.n_layers)
     ids = lm.refusal_token_ids
@@ -99,9 +104,9 @@ def run_sweep(
             raise ValueError(f"k={k} exceeds the subspace rank {subspace.shape[0]}")
         layers = bands[band]
         sub = subspace[:k]
-        spec = EditSpec(direction=sub.tolist(), alpha=alpha, layers=layers, mode="weights")
-        ctx = hooks.ablate(lm, sub, alpha, layers) if mode == "hooks" else temporarily_orthogonalized(lm, sub, alpha, layers)
-        with ctx:
+        spec = EditSpec(direction=sub.tolist(), alpha=alpha, layers=layers, mode="weights",
+                        side="readers" if mode == "readers" else "writers")
+        with edit(lm, sub, alpha, layers):
             h_logits = last_logits(lm, harmful_val, batch_size)
             s_logits = last_logits(lm, harmless_val, batch_size)
             sep = detect.separation(lm, ref_directions, harmful_val, harmless_val, batch_size=batch_size)

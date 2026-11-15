@@ -67,7 +67,8 @@ def diff_pairs_from_edit(
 ) -> Iterator[tuple[str, Tensor]]:
     """The weight difference an ``EditSpec`` *would* produce, computed analytically from the
     clean model: delta W = -alpha B^T B W per writer. Lets the sweep score the weight-mode
-    version of an edit without copying or modifying the model.
+    version of an edit without copying or modifying the model. These are the writer matrices
+    only, the ones the weight detector reads: a reader-side edit changes none of them.
 
     ``factored`` yields the (k, d_in) factor -alpha B W instead of the (d_model, d_in) delta.
     B^T has orthonormal columns, so the two have the same singular values and Frobenius norm
@@ -75,7 +76,7 @@ def diff_pairs_from_edit(
     from .hooks import orthonormal
 
     basis = orthonormal(spec.vector)
-    edited = set(range(lm.n_layers) if spec.layers is None else spec.layers)
+    edited = set(range(lm.n_layers) if spec.layers is None else spec.layers) if spec.side == "writers" else set()
     for i in layers:
         for j, w in enumerate(lm.write_params(i)):
             t = (w if isinstance(w, nn.Parameter) else w.weight).detach().float()

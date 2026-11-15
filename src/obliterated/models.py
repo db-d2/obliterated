@@ -87,6 +87,24 @@ class LM:
             raise ValueError(f"no down_proj found in layer {layer}; add support for this architecture")
         return out
 
+    @property
+    def final_norm(self) -> nn.Module:
+        """The norm between the last layer's output and the output head."""
+        return self.model.model.norm
+
+    def read_modules(self, layer: int) -> list[tuple[nn.Module, nn.Linear]]:
+        """Every matrix that reads the residual stream in this layer, each with the norm that
+        stands between it and the stream: the attention query, key and value projections and
+        the MLP's gate and up projections. Mixture-of-experts blocks are not covered."""
+        block = self.layers[layer]
+        mlp_norm = block.pre_feedforward_layernorm if self.has_post_norms else block.post_attention_layernorm
+        found = [(block.input_layernorm, getattr(block.self_attn, n, None)) for n in ("q_proj", "k_proj", "v_proj")]
+        found += [(mlp_norm, getattr(block.mlp, n, None)) for n in ("gate_proj", "up_proj")]
+        if not all(isinstance(lin, nn.Linear) for _, lin in found):
+            raise ValueError(f"layer {layer}: cannot name every matrix that reads the residual stream; "
+                             "add support for this architecture")
+        return found
+
     # ---- prompting ------------------------------------------------------------------------
 
     def format(self, instruction: str) -> str:

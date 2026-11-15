@@ -33,7 +33,9 @@ def main() -> None:
     ap.add_argument("--alphas", default="0.25,0.5,0.75,1.0")
     ap.add_argument("--ks", default="1,2,4")
     ap.add_argument("--bands", default="all,mid,source,source±2")
-    ap.add_argument("--mode", default="hooks", choices=["hooks", "weights"])
+    ap.add_argument("--mode", default="hooks", choices=["hooks", "weights", "readers"],
+                    help="hooks: runtime ablation. weights: orthogonalize the writer matrices. readers: leave the "
+                         "writers alone and make the matrices that read the stream ignore the direction")
     ap.add_argument("--method", default="pca", choices=["pca", "iterative"])
     ap.add_argument("--source", default="arditi", choices=["arditi", "advbench", "harmbench"])
     ap.add_argument("--n-train", type=int, default=128)
