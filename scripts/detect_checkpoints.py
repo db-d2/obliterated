@@ -19,9 +19,10 @@ weights again. --rescore-weights recomputes only the weight fields of the rows a
 (no model is loaded) and refreshes their labels from the registry. Weights are downloaded for
 analysis only.
 
-With --record a row also carries weight_refusal_alignment (and _med, and weight_vocab_alignment):
-how much of the base's refusal direction lies in the span of a changed matrix's top factors.
-It finds an abliteration under a dense change that hides it from the energy shares.
+With --record a row also carries weight_refusal_alignment (and _med, weight_vocab_alignment, and
+weight_refusal_alignment_any, the largest of them all): how much of the base's refusal direction
+lies in the span of a changed matrix's top factors. It finds an abliteration under a dense
+change that hides it from the energy shares.
 --add-alignment computes it for rows scored before it existed, from their records alone.
 
 When the disk cannot hold a whole set (thirty 8B fine-tunes are about 480 GB), score each

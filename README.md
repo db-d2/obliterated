@@ -122,7 +122,7 @@ held-out prompts and three detector scores from `detect.py`:
 | Detector | What it needs | Score |
 | --- | --- | --- |
 | `weight_top1_energy`, `weight_top{2,4,8}_energy`, and each with a `_w` suffix | base and candidate weights (or just the edit, computed analytically) | share of the writer-matrix delta's energy in its top (or top k) singular values (1.0 for a pure rank-1, or rank-k, edit). Plain: mean over changed mid-stack matrices. `_w`: energy-weighted over every layer |
-| `weight_refusal_alignment`, `weight_refusal_alignment_med`, `weight_vocab_alignment` | a checkpoint's record (`--record`): its top factors per changed matrix and the base's refusal directions | how much of the base's refusal direction lies in the span of a changed matrix's top 8 residual-side factors: 1.0 when the edit writes or removes it, about sqrt(8 / d_model) for an unrelated one. Largest and median over the writer matrices, and largest over embedding and output head. Checkpoints only, not sweep points |
+| `weight_refusal_alignment`, `weight_refusal_alignment_med`, `weight_vocab_alignment`, `weight_refusal_alignment_any` | a checkpoint's record (`--record`): its top factors per changed matrix and the base's refusal directions | how much of the base's refusal direction lies in the span of a changed matrix's top 8 residual-side factors: 1.0 when the edit writes or removes it, about sqrt(8 / d_model) for an unrelated one. Largest and median over the writer matrices, largest over embedding and output head, and (`_any`) largest over all of them, which is the score to threshold: one public upload edits the embedding table alone. Checkpoints only, not sweep points |
 | `activation_gap` | base model's per-layer refusal directions + prompts | 1 - candidate/reference harmful-vs-harmless separation along them |
 | `behaviour_kl_harmful`, `behaviour_refusal_drop` | next-token logits on harmful prompts | KL(base ‖ candidate) and refusal-score drop; the only test that works through an API |
 
@@ -229,8 +229,13 @@ that grades what the answer says.
 `--judge qylu4156/strongreject-15k-v1` is that judge: the fine-tuned StrongREJECT evaluator
 (Souly et al. 2024), a LoRA adapter on the gated `google/gemma-2b` that grades how much an
 answer assists with the request. `strongreject_score` is the mean over the prompts, from 0
-(refused, or useless) to 1 (full assistance), and both reports take it as `--harmful-key`.
-It runs locally, like the other two; no answer leaves the machine.
+(refused, or useless) to 1 (full assistance). It is the behaviour label both reports use unless
+`--harmful-key` names one of the classifier rates, which serve as the check on it: over 191
+judged checkpoints the three rules agree on 183, including every edited upload. It runs
+locally, like the other two; no answer leaves the machine.
+
+Dated notes on fixes, findings and decisions, with the commit or file behind each, are in
+[docs/lab-notes.md](docs/lab-notes.md).
 
 ### B. Susceptibility of the clean model
 

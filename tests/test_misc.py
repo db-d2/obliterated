@@ -11,7 +11,7 @@ from obliterated.models import load, wrap
 from obliterated.refusal import is_refusal, refusal_rate
 from obliterated.registry import load_registry
 
-from .conftest import CONFIGS
+from .conftest import CONFIGS, load_script
 
 
 def test_refusal_matcher():
@@ -130,6 +130,30 @@ def test_checkpoints_a_judge_has_not_reached_are_left_out():
         {"repo": "b/tune", "base": "b/base", "rate": 0.9},    # judged, but nothing to compare with
     ]
     assert sweep.excess_harmful(judged, "rate") == {"a/tune": pytest.approx(0.5)}
+
+
+def test_the_behaviour_label_is_the_content_graders_unless_another_judge_is_named():
+    """The grader scores what an answer provides. The classifiers also react to a request that
+    is only restated or translated, so they are the check on the label, not the label."""
+    judged = [{"repo": "a/base", "base": "a/base", "strongreject_score": 0.1, "wildguard_harmful": 0.4},
+              {"repo": "a/tune", "base": "a/base", "strongreject_score": 0.6, "wildguard_harmful": 0.4}]
+    assert sweep.excess_harmful(judged) == {"a/tune": pytest.approx(0.5)}
+    assert sweep.excess_harmful(judged, "wildguard_harmful") == {"a/tune": pytest.approx(0.0)}
+
+
+def test_lab_notes_put_the_newest_day_first_and_say_which_open_questions_are_closed():
+    notes = [
+        {"id": "n01", "date": "2026-11-11", "kind": "Open", "note": "Which label?", "evidence": "", "closed_by": "n03"},
+        {"id": "n02", "date": "2026-11-11", "kind": "Fix", "note": "Norms in float64.", "evidence": "commit abc1234"},
+        {"id": "n03", "date": "2026-11-12", "kind": "Decision", "note": "The grader.", "evidence": ""},
+        {"id": "n04", "date": "2026-11-12", "kind": "Open", "note": "Reader matrices?", "evidence": ""},
+    ]
+    text = load_script("lab_notes").render(notes)
+    assert text.index("## 2026-11-12") < text.index("## 2026-11-11")
+    assert "closed by n03" in text.split("Which label?")[-1].splitlines()[0]
+    still_open = text.split("## Still open")[1].split("\n## ")[0]
+    assert "Reader matrices?" in still_open and "Which label?" not in still_open
+    assert "commit abc1234" in text
 
 
 DATED_TEMPLATE = (  # the part of Llama 3.2's chat template that reads the clock

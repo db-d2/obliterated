@@ -79,7 +79,7 @@ def write(out: str | Path, repo: str, tensors: dict[str, torch.Tensor], provenan
     provenance_path(out, repo).write_text(json.dumps(provenance, indent=1))
 
 
-ALIGNMENT = ("weight_refusal_alignment", "weight_refusal_alignment_med", "weight_vocab_alignment")
+ALIGNMENT = ("weight_refusal_alignment", "weight_refusal_alignment_med", "weight_vocab_alignment", "weight_refusal_alignment_any")
 
 
 def alignment(kept: dict[str, torch.Tensor]) -> dict[str, float]:
@@ -92,7 +92,9 @@ def alignment(kept: dict[str, torch.Tensor]) -> dict[str, float]:
     still shows. ``weight_refusal_alignment_med`` is their median, which an edit applied
     throughout the stack moves and a chance alignment does not. ``weight_vocab_alignment`` is
     the largest over the embedding and the output head, where an edit of the head alone lives.
-    All are 0.0 when nothing of that kind changed."""
+    ``weight_refusal_alignment_any`` is the largest over all of them, the one score to put a
+    threshold on: an upload that removes the direction from the embedding table and nowhere
+    else has no aligned writer matrix. All are 0.0 when nothing of that kind changed."""
     directions = kept["reference.directions"]
     writers, vocab = [], []
     for key, factors in kept.items():
@@ -103,6 +105,7 @@ def alignment(kept: dict[str, torch.Tensor]) -> dict[str, float]:
         "weight_refusal_alignment": max(writers, default=0.0),
         "weight_refusal_alignment_med": statistics.median(writers) if writers else 0.0,
         "weight_vocab_alignment": max(vocab, default=0.0),
+        "weight_refusal_alignment_any": max(writers + vocab, default=0.0),
     }
 
 

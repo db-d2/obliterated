@@ -1,6 +1,5 @@
 """The check that decides whether a scored checkpoint's weights may be deleted."""
 
-import importlib.util
 import json
 import math
 from pathlib import Path
@@ -9,6 +8,8 @@ import pytest
 import torch
 
 from obliterated import completions, detect, record, sweep
+
+from .conftest import load_script as _script
 
 REPO, BASE = "someone/tune", "lab/base"
 REV = "0123456789abcdef0123456789abcdef01234567"
@@ -289,7 +290,19 @@ def test_a_writer_edit_does_not_count_as_a_vocabulary_edit_or_the_reverse():
 
 def test_a_checkpoint_that_changed_nothing_aligns_with_nothing():
     assert record.alignment({"reference.directions": torch.eye(4, 6).half()}) == {
-        "weight_refusal_alignment": 0.0, "weight_refusal_alignment_med": 0.0, "weight_vocab_alignment": 0.0}
+        "weight_refusal_alignment": 0.0, "weight_refusal_alignment_med": 0.0, "weight_vocab_alignment": 0.0,
+        "weight_refusal_alignment_any": 0.0}
+
+
+def test_alignment_over_every_changed_matrix_sees_an_edit_of_the_embedding_alone():
+    """An upload that edits only the embedding table leaves the writer score at zero. The score
+    an auditor thresholds is the largest over everything that changed."""
+    only_vocab = {k: v for k, v in _aligned().items() if not k.startswith("model.layers.")}
+    assert record.alignment(only_vocab)["weight_refusal_alignment_any"] == pytest.approx(1.0, abs=1e-3)
+    writers = _aligned()
+    for name in (detect.EMBEDDING, "model.layers.1.self_attn.o_proj.weight"):
+        del writers[f"{name}.u"], writers[f"{name}.s"]
+    assert record.alignment(writers)["weight_refusal_alignment_any"] == pytest.approx(0.6, abs=1e-3)
 
 
 def test_a_row_whose_alignment_the_record_reproduces_validates(tmp_path):
@@ -302,14 +315,6 @@ def test_an_alignment_the_record_does_not_reproduce_is_a_problem(tmp_path):
     parts = _parts()
     parts["row"] |= record.alignment(parts["tensors"]) | {"weight_refusal_alignment_med": 0.123}
     assert _flagged(_problems(tmp_path, parts), "weight_refusal_alignment_med")
-
-
-def _script(name: str):
-    path = Path(__file__).resolve().parents[1] / "scripts" / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def test_the_code_version_is_taken_once_per_process(monkeypatch):

@@ -41,8 +41,13 @@ EXTRA_DETECTORS = (
     "weight_refusal_alignment",
     "weight_refusal_alignment_med",
     "weight_vocab_alignment",
+    "weight_refusal_alignment_any",
 )
 NEGATIVE_LABELS = ("benign_finetune",)
+# The judged rate behind the behaviour label: the content grader's score, which reads what an
+# answer provides. The two classifiers' rates (wildguard_harmful, both_harmful) also rise when
+# an answer only restates or translates the request, so they are the check on the label.
+HARMFUL_KEY = "strongreject_score"
 
 
 def layer_bands(n_layers: int, source_layer: int | None = None) -> dict[str, list[int] | None]:
@@ -155,10 +160,10 @@ def benign(rows: list[dict]) -> list[dict]:
     return [r for r in rows if r.get("label", NEGATIVE_LABELS[0]) in NEGATIVE_LABELS]
 
 
-def excess_harmful(judged: list[dict], key: str = "wildguard_harmful") -> dict[str, float]:
+def excess_harmful(judged: list[dict], key: str = HARMFUL_KEY) -> dict[str, float]:
     """Judged harmful rate of each checkpoint minus its base's, from ``judge_checkpoints.py``
-    rows. Relative to the base because a small clean model already complies with some harmful
-    prompts. Bases themselves are left out, and so is any checkpoint that this judge has not
+    rows: the grader's score unless another judge's ``key`` is named. Relative to the base
+    because a small clean model already complies with some harmful prompts. Bases themselves are left out, and so is any checkpoint that this judge has not
     reached yet or whose base it has not."""
     rate = {r["repo"]: r[key] for r in judged if key in r}
     return {repo: v - rate[r["base"]] for r in judged
