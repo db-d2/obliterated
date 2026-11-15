@@ -265,8 +265,12 @@ def weight_scores(
     Also returns ``weight_n_active``, the number of matrices whose delta carries at least 1e-4
     of the largest one's energy, and ``per_matrix`` (every changed matrix's spectrum summary).
     """
-    full = weight_recovery_energy(pairs, topk)
-    per = full["per_matrix"]
+    return scores_from_spectra(weight_recovery_energy(pairs, topk)["per_matrix"], mid, topk)
+
+
+def scores_from_spectra(per: list[dict], mid: Iterable[int], topk: tuple[int, ...] = TOPK) -> dict[str, object]:
+    """``weight_scores`` from per-matrix spectrum summaries that already exist. Each needs
+    ``name``, ``fro_norm``, ``stable_rank`` and ``top{k}_energy`` for 1 and every k in ``topk``."""
     mid = set(mid)
     mid_rows = [r for r in per if layer_of(r["name"]) in mid]
     energy = [r["fro_norm"] ** 2 for r in per]
@@ -284,6 +288,198 @@ def weight_scores(
     out["weight_n_active"] = sum(e >= 1e-4 * max(energy) for e in energy) if per else 0
     out["per_matrix"] = per
     return out
+
+
+# ---- 1b. the matrices that read the residual stream ------------------------------------------------
+
+READERS = ("self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
+           "mlp.gate_proj.weight", "mlp.up_proj.weight")
+HEAD = "lm_head.weight"
+FINAL_NORM = "model.norm.weight"
+
+
+def _exact_top(gram: Tensor, k: int) -> tuple[Tensor, Tensor]:
+    evals, evecs = torch.linalg.eigh(gram)
+    top = torch.arange(evals.numel() - 1, -1, -1)[:k]  # eigh returns them ascending
+    return evals[top].clamp_min(0), evecs[:, top]
+
+
+def gram_top(
+    gram: Tensor, k: int = 8, extra: int = 56, tol: float = 1e-10, max_iter: int = 300, seed: int = 0
+) -> tuple[Tensor, Tensor, dict]:
+    """The k largest eigenvalues of a symmetric positive semi-definite matrix, largest first,
+    and their eigenvectors as columns, in float64, with how they were found.
+
+    ``top_factors`` decomposes the whole matrix, which takes 20 seconds at 4096 rows. A model
+    has five reading matrices per layer, so that is most of an hour per 8B checkpoint. This
+    iterates a block of k + extra vectors instead (multiply, orthonormalize, and every fourth
+    round solve the small problem inside the block) and stops when the k values have settled
+    to ``tol`` of the largest. A low-rank change on top of anything is found in a few rounds.
+    A flat spectrum never settles; after ``max_iter`` rounds, and for a matrix no larger than
+    the block, the whole matrix is decomposed after all, so the answer is always either
+    converged or exact. The start is seeded: the same matrix gives the same factors."""
+    gram = gram.double()
+    n = gram.shape[0]
+    if n <= k + extra:
+        return (*_exact_top(gram, k), {"iterations": 0, "exact": True})
+    q = torch.linalg.qr(torch.randn(n, k + extra, dtype=torch.float64, generator=torch.Generator().manual_seed(seed))).Q
+    previous = None
+    for it in range(1, max_iter + 1):
+        q = torch.linalg.qr(gram @ q).Q
+        if it % 4:
+            continue
+        evals, inner = torch.linalg.eigh(q.T @ gram @ q)
+        top = evals.flip(0)[:k]
+        if previous is not None and float((top - previous).abs().max()) <= tol * float(top[0]):
+            return top.clamp_min(0), q @ inner.flip(1)[:, :k], {"iterations": it, "exact": False}
+        previous = top
+    return (*_exact_top(gram, k), {"iterations": max_iter, "exact": True})
+
+
+def norm_in_front(name: str, known: Iterable[str]) -> str:
+    """The norm weight a reading matrix sits behind, given the tensor names that exist. The
+    output head reads behind the final norm and the attention behind ``input_layernorm``.
+    Gemma 2 normalizes a second time in front of the MLP; elsewhere the MLP reads behind
+    ``post_attention_layernorm``."""
+    if name == HEAD:
+        return FINAL_NORM
+    if ".self_attn." in name:
+        return name[: name.index(".self_attn.")] + ".input_layernorm.weight"
+    stem = name[: name.index(".mlp.")]
+    pre = f"{stem}.pre_feedforward_layernorm.weight"
+    return pre if pre in known else f"{stem}.post_attention_layernorm.weight"
+
+
+def reader_layout(index: dict[str, Path]) -> list[tuple[str, str]]:
+    """(reading matrix, the norm it sits behind) for a snapshot's tensors: each layer's
+    attention query, key and value projections and its MLP's gate and up projections, in layer
+    order, then the output head."""
+    found = []
+    for name in index:
+        suffix = next((s for s in READERS if name.endswith("." + s)), None)
+        if suffix is not None and layer_of(name) is not None:
+            found.append((layer_of(name), READERS.index(suffix), name))
+    return [(name, norm_in_front(name, index)) for *_, name in sorted(found)] + [(HEAD, FINAL_NORM)]
+
+
+def _factors(gram: Tensor, name: str, k: int) -> tuple[Tensor, Tensor, dict]:
+    """Top k singular values and input-side singular vectors of a change, and its spectrum
+    summary, from the Gram matrix of the change."""
+    values, vectors, how = gram_top(gram, k)
+    total = float(gram.diagonal().sum())
+    share = values.cumsum(0) / total
+    summary = {
+        "name": name, "fro_norm": math.sqrt(total), "stable_rank": total / float(values[0]),
+        "participation_ratio": total**2 / float(gram.pow(2).sum()),
+        "top1_energy": float(share[0]),
+        **{f"top{j}_energy": float(share[min(j, len(share)) - 1]) for j in TOPK},
+        **how,
+    }
+    return values.sqrt().float(), vectors.float(), summary
+
+
+def scan_readers(
+    base_dir: str | Path, cand_dir: str | Path, directions: Tensor, k: int = 8, rows: int = 4096
+) -> Iterator[dict]:
+    """What changed in every matrix that reads the residual stream, from two local snapshots,
+    a slice of rows at a time: no model is loaded and nothing larger than a slice is held.
+
+    A reader never sees the stream itself. It sees it behind a norm, W (g * x / rms(x)), where
+    g is the norm's weight, or one plus it for Gemma. So there are two matrices to compare,
+    and each answers something the other cannot:
+
+    - The matrix composed with its norm, E = W diag(g), which is what acts on the stream. An
+      edit that makes a reader ignore a direction r of the stream is rank one in E with r
+      itself on the input side, whatever the gains, so this is where its alignment is read
+      (``eu``). A changed gain shows here as well.
+    - The stored matrix W, as for the writers. The same edit has r / g on its input side
+      there, and a gain near zero (Qwen 2.5 has such a coordinate) collapses that onto one
+      coordinate, which rounding noise then matches: do not divide a direction by a gain.
+      What the stored matrix is for: its energy shares (``summary``), because the rounding
+      noise of a re-save, scaled by an uneven gain, piles up on a few coordinates of E and
+      passes for a low-rank change; and the alignment of an edit that projects a direction
+      out of the matrix's input without regard to the norm, which has r itself here (``u``).
+
+    Besides the two changes, how strongly each side reads each direction, |E r|, with its own
+    gain: the functional question, whatever was changed to answer it.
+
+    Yields one dict per reading matrix of the base, in layer order, the output head last (a
+    head the base or the checkpoint ties to its embedding is that embedding; only the tokens
+    both have are compared):
+
+    - ``name``, and ``missing`` if the checkpoint has no such matrix or one of another shape
+    - ``norm``, the norm in front of it, with ``gain`` (the base's) and, if the checkpoint's
+      differs (``gain_changed``), ``gain_cand``
+    - ``read_base``, ``read_cand``: |E r| per row r of ``directions``. Their ratio is 1 for an
+      untouched reader and 1 - alpha for one edited with strength alpha
+    - ``changed``: whether the stored matrix differs. If so ``s``, ``u`` and ``summary``: the
+      top k singular values of its change, their input-side singular vectors as columns
+      (what ``refusal_alignment`` takes), and the spectrum fields ``scores_from_spectra``
+      aggregates
+    - if the stored matrix or the gain differs, the same for E: ``es``, ``eu``, ``summary_eff``
+
+    The factors come from (d_model, d_model) Gram matrices accumulated in float64, and
+    ``gram_top``. With the gain unchanged, E's is the stored matrix's scaled by g g^T."""
+    import json
+
+    from safetensors import safe_open
+
+    bi, ci = _tensor_index(base_dir), _tensor_index(cand_dir)
+    one = 1.0 if json.loads((Path(base_dir) / "config.json").read_text()).get("model_type", "").startswith("gemma") else 0.0
+    unit = directions.float()
+    unit = unit / unit.norm(dim=1, keepdim=True).clamp_min(1e-30)
+
+    def gain(index: dict[str, Path], norm: str) -> Tensor:
+        with safe_open(index[norm], "pt") as f:
+            return f.get_tensor(norm).float() + one
+
+    for name, norm in reader_layout(bi):
+        bname = name if name in bi else EMBEDDING
+        cname = name if name in ci else EMBEDDING if name == HEAD else None
+        if bname not in bi or cname not in ci or norm not in bi:
+            yield {"name": name, "missing": True}
+            continue
+        gb = gain(bi, norm)
+        gc = gain(ci, norm) if norm in ci else gb
+        with safe_open(bi[bname], "pt") as fb, safe_open(ci[cname], "pt") as fc:
+            wb, wc = fb.get_slice(bname), fc.get_slice(cname)
+            shape_b, shape_c = wb.get_shape(), wc.get_shape()
+            if shape_b[1:] != shape_c[1:] or gb.shape != gc.shape or (name != HEAD and shape_b != shape_c):
+                yield {"name": name, "missing": True}
+                continue
+            n, d = min(shape_b[0], shape_c[0]), shape_b[1]
+            gram = torch.zeros(d, d, dtype=torch.float64)
+            read = torch.zeros(2, len(unit), dtype=torch.float64)
+            scaled_b, scaled_c = (unit * gb).T, (unit * gc).T
+            moved = not torch.equal(gb, gc)
+            gram_eff = torch.zeros(d, d, dtype=torch.float64) if moved else None
+            peak, finite = 0.0, True
+            for a in range(0, n, rows):
+                xb, xc = wb[a:min(a + rows, n)].float(), wc[a:min(a + rows, n)].float()
+                read[0] += (xb @ scaled_b).double().pow(2).sum(0)
+                read[1] += (xc @ scaled_c).double().pow(2).sum(0)
+                delta = xc - xb
+                finite = finite and bool(torch.isfinite(delta).all())
+                size = float(delta.abs().max())
+                if size > 0:
+                    part = delta.double()
+                    gram += part.T @ part
+                    peak = max(peak, size)
+                if moved:  # E_c - E_b, the difference of the nearly equal matrices taken before either is scaled
+                    part = (delta * gc + xb * (gc - gb)).double()
+                    gram_eff += part.T @ part
+        out = {"name": name, "rows": n, "norm": norm, "gain": gb, "changed": peak > 0 and finite, "finite": finite,
+               "gain_changed": moved, "read_base": read[0].sqrt(), "read_cand": read[1].sqrt()}
+        if moved:
+            out["gain_cand"] = gc
+        if out["changed"]:
+            out["s"], out["u"], out["summary"] = _factors(gram, name, k)
+        if finite and (out["changed"] or moved):
+            if not moved:
+                gram_eff = gram * torch.outer(gb, gb).double()
+            if float(gram_eff.diagonal().sum()) > 0:
+                out["es"], out["eu"], out["summary_eff"] = _factors(gram_eff, name, k)
+        yield out
 
 
 # ---- 2. activation gap ------------------------------------------------------------------------------

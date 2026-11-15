@@ -109,6 +109,83 @@ def alignment(kept: dict[str, torch.Tensor]) -> dict[str, float]:
     }
 
 
+READER_SCORES = ("reader_refusal_alignment", "reader_refusal_alignment_med", "reader_refusal_alignment_plain",
+                 "reader_head_alignment", "reader_head_alignment_plain", "reader_refusal_alignment_any",
+                 "reader_read_drop", "reader_read_drop_med", "reader_head_read_drop")
+
+
+def _read_drop(read: torch.Tensor) -> float:
+    """1 minus the smallest ratio, over the base's refusal directions, of how strongly the
+    checkpoint's matrix reads a direction to how strongly the base's does."""
+    base, cand = read.double()
+    known = base > 0
+    return float(1 - (cand[known] / base[known]).min()) if bool(known.any()) else 0.0
+
+
+def reader_scores(kept: dict[str, torch.Tensor]) -> dict[str, float]:
+    """The reading side of a checkpoint, from the tensors ``scripts/reader_weights.py`` keeps.
+
+    Two questions per reading matrix, both about the base's refusal directions.
+
+    Alignment, as for the writers: how much of a direction lies in the span of the top
+    input-side factors of a change. ``reader_refusal_alignment`` reads it off the change in
+    the matrix composed with its norm (``.eu``), where an edit that makes the reader ignore a
+    direction of the stream has that direction exactly. The ``_plain`` scores read it off the
+    change in the stored matrix (``.u``), where an edit lands that projects the direction out
+    of the matrix's input without regard to the norm. See ``detect.scan_readers``.
+
+    Read drop: how much less strongly the matrix reads a direction than the base's does, 0
+    for an untouched reader and alpha for one edited with strength alpha. Every matrix has
+    one, changed or not, and a changed norm counts.
+
+    Each is the largest over the layers' matrices; ``_med`` is the median over them; the
+    output head is reported apart. ``reader_refusal_alignment_any`` is the largest alignment
+    of all, either way. Everything is 0.0 when no reading matrix changed."""
+    directions = kept["reference.directions"].float()
+    found = {"eu": [], "u": [], "read": []}
+    head = {"eu": 0.0, "u": 0.0, "read": 0.0}
+    for key, value in kept.items():
+        name, _, kind = key.rpartition(".")
+        if kind not in found or name == "reference":
+            continue
+        score = _read_drop(value) if kind == "read" else detect.refusal_alignment(value, directions)
+        if detect.layer_of(name) is None:
+            head[kind] = score
+        else:
+            found[kind].append(score)
+    return {
+        "reader_refusal_alignment": max(found["eu"], default=0.0),
+        "reader_refusal_alignment_med": statistics.median(found["eu"]) if found["eu"] else 0.0,
+        "reader_refusal_alignment_plain": max(found["u"], default=0.0),
+        "reader_head_alignment": head["eu"],
+        "reader_head_alignment_plain": head["u"],
+        "reader_refusal_alignment_any": max([*found["eu"], *found["u"], head["eu"], head["u"]]),
+        "reader_read_drop": max(found["read"], default=0.0),
+        "reader_read_drop_med": statistics.median(found["read"]) if found["read"] else 0.0,
+        "reader_head_read_drop": head["read"],
+    }
+
+
+def code_versions(script: Path) -> dict:
+    """The code and libraries behind a score: the commit, whether anything was uncommitted, a
+    hash of the sources that produce the scores (the commit alone does not identify them while
+    changes are uncommitted) and the library versions."""
+    import platform
+    import subprocess
+    from importlib.metadata import version
+
+    root = script.resolve().parents[1]
+
+    def git(*a: str) -> str:
+        return subprocess.run(["git", *a], cwd=root, capture_output=True, text=True, check=False).stdout.strip()
+
+    sources = sorted((root / "src" / "obliterated").glob("*.py")) + [script.resolve()]
+    return {"obliterated": git("rev-parse", "--short", "HEAD") + ("+uncommitted" if git("status", "--porcelain") else ""),
+            "source_sha256": hashlib.sha256(b"".join(f.read_bytes() for f in sources)).hexdigest(),
+            "python": platform.python_version(),
+            **{pkg: version(pkg) for pkg in ("torch", "transformers", "huggingface_hub", "safetensors")}}
+
+
 def _close(a: float, b: float, tol: float = 1e-4) -> bool:
     return abs(a - b) <= tol * max(1.0, abs(b))
 
@@ -136,6 +213,77 @@ def _answers(out: Path, repo: str, prompts: list[str], whose: str) -> list[str]:
     cut = sum(map(completions.cut_off, texts))
     if cut > 0.2 * len(texts):
         problems.append(f"completions of {whose} {repo}: {cut} of {len(texts)} stop inside the reasoning")
+    return problems
+
+
+def _weights(files: list[dict] | None) -> list[tuple]:
+    return sorted((f["name"], f["bytes"], f["blob"]) for f in files or [] if f["name"].endswith(".safetensors"))
+
+
+def _json(path: Path):
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def validate_readers(row: dict, out: str | Path, main_out: str | Path) -> list[str]:
+    """Everything wrong with what the reading-side pass saved for ``row``'s checkpoint; empty
+    means the weights it downloaded for that are no longer needed. Reads only from disk.
+
+    ``main_out`` is the results file of the pass that scored the checkpoint's behaviour. The
+    two passes have to describe the same weights, so the revision and the weight files read
+    here (name, size and content hash) must be the ones recorded there, for the checkpoint and
+    for its base. Beyond that: every reading matrix of the model was read, each changed one
+    has its factors, the gain of every norm in front of one was kept, the saved singular
+    values agree with the saved spectra, and the record reproduces the row's scores."""
+    out, repo = Path(out), row["repo"]
+    undefined = {"reader_stable_rank"} if row.get("reader_n_matrices") == 0 else set()
+    problems = [f"{k} is not finite" for k, v in row.items()
+                if k.startswith("reader_") and isinstance(v, float) and not math.isfinite(v) and k not in undefined]
+    info, main = _json(provenance_path(out, repo)), _json(provenance_path(main_out, repo)) or {}
+    if info is None or not tensors_path(out, repo).exists():
+        return [*problems, f"no reader record for {repo} beside {out.name}"]
+    for key in ("revision", "base_revision"):
+        if not REVISION.fullmatch(str(info.get(key))):
+            problems.append(f"provenance: {key} is not a pinned commit ({info.get(key)!r})")
+        elif info[key] != main.get(key):
+            problems.append(f"{key}: the weights read are at {info[key][:12]}, the ones scored were at {str(main.get(key))[:12]}")
+    for key, whose in (("files", "checkpoint"), ("base_files", "base")):
+        if not _weights(info.get(key)) or _weights(info.get(key)) != _weights(main.get(key)):
+            problems.append(f"the {whose}'s weights are not the files that were scored")
+    if info.get("missing"):
+        problems.append(f"missing or unreadable in the checkpoint: {', '.join(info['missing'])}")
+    matrices, n_layers = info.get("matrices") or [], info.get("n_layers")
+    if not isinstance(n_layers, int) or len(matrices) + len(info.get("missing") or []) != 5 * n_layers + 1:
+        problems.append(f"{len(matrices)} reading matrices were read; a model of {n_layers} layers has {5 * (n_layers or 0) + 1}")
+
+    kept = load_file(tensors_path(out, repo))
+    problems += [f"{k} in the record is not finite" for k, v in kept.items() if not torch.isfinite(v.float()).all()]
+    if "reference.directions" not in kept:
+        return [*problems, "reference.directions is not in the record"]
+    problems += [f"{name}: how strongly it reads the directions is not in the record" for name in matrices if f"{name}.read" not in kept]
+    norms = {k.removeprefix("gain.") for k in kept if k.startswith("gain.")}
+    lost = sorted({norm for name in matrices if (norm := detect.norm_in_front(name, norms)) not in norms})
+    if lost:
+        return [*problems, *(f"{norm}: the gain of this norm is not in the record" for norm in lost)]
+    spectra = _json(spectra_path(out, repo))
+    in_layers = None if spectra is None else sum(detect.layer_of(m["name"]) is not None and bool(m.get("stored")) for m in spectra)
+    if in_layers != row.get("reader_n_changed"):
+        problems.append(f"spectra: {in_layers} changed layer matrices saved, the row counts {row.get('reader_n_changed')}")
+    for m in spectra or []:
+        for which, values, vectors in (("stored", "s", "u"), ("effective", "es", "eu")):
+            saved, s, u = m.get(which), kept.get(f"{m['name']}.{values}"), kept.get(f"{m['name']}.{vectors}")
+            if not saved:
+                continue
+            if s is None or u is None:
+                problems.append(f"{m['name']}: the singular values or directions of its {which} change are not in the record")
+            elif not _same(float(s[0]), math.sqrt(saved["top1_energy"]) * saved["fro_norm"]):
+                problems.append(f"{m['name']}: saved top singular value {float(s[0]):.5g} of its {which} change disagrees "
+                                f"with the spectrum ({math.sqrt(saved['top1_energy']) * saved['fro_norm']:.5g})")
+            elif float(s.double().pow(2).sum().sqrt()) > saved["fro_norm"] * (1 + 1e-3):
+                problems.append(f"{m['name']}: the norm {saved['fro_norm']:.5g} of its {which} change is below what its "
+                                "saved singular values carry")
+    for key, value in reader_scores(kept).items():
+        if not isinstance(row.get(key), (int, float)) or not _close(row[key], value):
+            problems.append(f"{key}: the row says {row.get(key)}, the record gives {value:.5f}")
     return problems
 
 

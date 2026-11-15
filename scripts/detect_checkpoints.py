@@ -59,13 +59,10 @@ import argparse
 import functools
 import hashlib
 import json
-import platform
 import shutil
-import subprocess
 import threading
 import traceback
 from datetime import UTC, datetime
-from importlib.metadata import version
 from pathlib import Path
 
 import torch
@@ -123,19 +120,7 @@ def reference(base_repo: str, prompts, args) -> dict:
 def versions() -> dict:
     """The code and libraries behind a score. Taken once per process: a run lasts days, and the
     sources on disk when a later checkpoint finishes need not be the ones that were loaded."""
-    root = Path(__file__).resolve().parents[1]
-
-    def git(*a: str) -> str:
-        return subprocess.run(["git", *a], cwd=root, capture_output=True, text=True, check=False).stdout.strip()
-
-    # The commit alone does not identify the code while changes are uncommitted, so the
-    # sources that produce the scores are hashed as well.
-    sources = sorted((root / "src" / "obliterated").glob("*.py")) + [Path(__file__).resolve()]
-    digest = hashlib.sha256(b"".join(f.read_bytes() for f in sources)).hexdigest()
-    return {"obliterated": git("rev-parse", "--short", "HEAD") + ("+uncommitted" if git("status", "--porcelain") else ""),
-            "source_sha256": digest,
-            "python": platform.python_version(),
-            **{pkg: version(pkg) for pkg in ("torch", "transformers", "huggingface_hub", "safetensors")}}
+    return record.code_versions(Path(__file__))
 
 
 def card(repo: str, revision: str, out: Path) -> dict | None:

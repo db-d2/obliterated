@@ -29,16 +29,19 @@ def load_registry(path: Path = REGISTRY) -> list[Checkpoint]:
     return [Checkpoint(**row) for row in data["checkpoints"]]
 
 
-def fetch(repo: str) -> Path:
+def fetch(repo: str, revision: str | None = None) -> Path:
     """Download a checkpoint's top-level weights, config and tokenizer files and return the
     snapshot directory. Subfolders (duplicate exports, training checkpoints), GGUF files and
-    LoRA adapters are skipped, so the safetensors in the result are exactly one model."""
+    LoRA adapters are skipped, so the safetensors in the result are exactly one model.
+
+    ``revision`` pins a commit. A pass that goes back to a checkpoint scored earlier has to
+    read the weights that were scored then, not whatever the repo holds now."""
     from huggingface_hub import HfApi, snapshot_download
 
     keep = (".safetensors", ".json", ".txt", ".jinja", ".model")
-    files = [s.rfilename for s in HfApi().model_info(repo).siblings]
+    files = [s.rfilename for s in HfApi().model_info(repo, revision=revision).siblings]
     want = [f for f in files if "/" not in f and f.endswith(keep) and not f.startswith("adapter")]
-    return Path(snapshot_download(repo, allow_patterns=want))
+    return Path(snapshot_download(repo, revision=revision, allow_patterns=want))
 
 
 def bases(checkpoints: Iterable[Checkpoint]) -> set[str]:
