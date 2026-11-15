@@ -26,6 +26,14 @@ every reading matrix of the base and of the checkpoint reads each refusal direct
 of every norm in front of one (and the checkpoint's, where it differs), the directions
 themselves, and what was read, at which revision, with which code.
 
+--span names a folder of base span files (scripts/refusal_span.py). The scores above look along
+the base's refusal directions at the last prompt token, the ones the main pass kept; an edit
+made from a direction taken at another position of the template's suffix shows only weakly
+there. With a span, each changed reading matrix also keeps how its Gram matrix changed on
+everything the base's directions span, at every position, and the row gains the
+reader_span_* scores (obliterated.record.span_scores). How strongly the checkpoint reads any
+direction inside that span can then still be worked out once its weights are deleted.
+
 --evict deletes a checkpoint from the Hugging Face cache once its reader record has been read
 back and validated, but only if this pass downloaded it: a checkpoint that was on disk already
 is someone else's to delete. The downloads this pass starts are listed in
@@ -38,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import hashlib
 import json
 import shutil
 import threading
@@ -85,15 +94,23 @@ def pinned(main_out: Path, repo: str) -> dict:
     return json.loads(path.read_text())
 
 
-def score(main_row: dict, main_out: str | Path, out: str | Path) -> dict:
+def score(main_row: dict, main_out: str | Path, out: str | Path, spans: str | Path | None = None) -> dict:
     """Read one checkpoint's reading matrices against its base's, write its spectra and record
-    beside ``out`` and return its row."""
+    beside ``out`` and return its row. With ``spans``, a folder of base span files, also on
+    the base's refusal span; it is an error if the base's file is not there, or is not about
+    the weights and the directions the main pass used."""
     main_out, out = Path(main_out), Path(out)
     repo, base = main_row["repo"], main_row["base"]
     main = pinned(main_out, repo)
+    reference = load_file(record.tensors_path(main_out, repo))["reference.directions"]
+    span, span_made = None, {}
+    if spans is not None:
+        span = record.checked_span(spans, base, main["base_revision"], main["base_files"], reference)
+        path = record.span_path(spans, base).resolve()
+        span_made = {"span": {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}}
     base_dir = locate(base, main["base_revision"], main["base_files"])
     cand_dir = locate(repo, main["revision"], main["files"])
-    read = record.read_readers(base_dir, cand_dir, load_file(record.tensors_path(main_out, repo))["reference.directions"], N_FACTORS)
+    read = record.read_readers(base_dir, cand_dir, reference, N_FACTORS, span=span)
     info, base_info = record.snapshot_info(cand_dir), record.snapshot_info(base_dir)
     row = {"repo": repo, "base": base, "label": main_row.get("label"), "family": main_row.get("family"),
            "params_b": main_row.get("params_b"), "revision": info["revision"], **read["fields"]}
@@ -106,7 +123,7 @@ def score(main_row: dict, main_out: str | Path, out: str | Path) -> dict:
         "base_revision": base_info["revision"], "base_files": base_info["files"],
         "main_record": str(record.tensors_path(main_out, repo)),
         "n_layers": read["n_layers"], "n_factors": N_FACTORS, "matrices": read["matrices"], "missing": read["missing"],
-        "gain_changed": read["gain_changed"],
+        "gain_changed": read["gain_changed"], **span_made,
         "scored_at": datetime.now(UTC).isoformat(timespec="seconds"), "versions": versions(),
     })
     return row
@@ -137,6 +154,8 @@ def main() -> None:
     ap.add_argument("--evict", action="store_true",
                     help="delete each checkpoint this pass downloaded once its reader record validates; implies --prefetch")
     ap.add_argument("--prefetch", action="store_true", help="download the next checkpoint while the current one is read")
+    ap.add_argument("--span", default=None, help="folder of base span files (scripts/refusal_span.py): also read every "
+                                                 "checkpoint on its base's refusal span")
     ap.add_argument("--check", action="store_true", help="validate the reader record of every row in --out, then exit")
     ap.add_argument("--min-free-gb", type=float, default=60.0, help="stop before a download if the cache disk has less free")
     args = ap.parse_args()
@@ -199,7 +218,7 @@ def main() -> None:
             arriving = prefetch(nxt["repo"], pins[nxt["repo"]]["revision"], pins[nxt["repo"]]["files"])
         started = time.time()
         try:
-            row = score(r, main_out, out)
+            row = score(r, main_out, out, args.span)
         except Exception as e:  # noqa: BLE001 - one broken or vanished upload should not end a long batch
             traceback.print_exc()
             failed.append((repo, f"{type(e).__name__}: {e}"))
@@ -210,7 +229,9 @@ def main() -> None:
             print(f"   {time.time() - started:.0f}s; {row['reader_n_changed']} layer readers changed, "
                   f"head {'changed' if row['reader_head_changed'] else 'unchanged'}; "
                   f"top-8 energy {row['reader_top8_energy_w']:.3f}, alignment {row['reader_refusal_alignment_any']:.3f}, "
-                  f"read drop {row['reader_read_drop']:.3f}", flush=True)
+                  f"read drop {row['reader_read_drop']:.3f}"
+                  + (f"; on the span {row['reader_span_read_drop']:.3f} (controls {row['reader_span_control_drop']:.3f}), "
+                     f"alignment {row['reader_span_alignment']:.3f}" if "reader_span_read_drop" in row else ""), flush=True)
             print(f"   reader record of {repo}: " + ("validated" if not problems else "".join(f"\n     - {p}" for p in problems)), flush=True)
         if problems:
             kept_back.append(repo)

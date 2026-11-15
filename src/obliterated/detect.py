@@ -378,8 +378,36 @@ def _factors(gram: Tensor, name: str, k: int) -> tuple[Tensor, Tensor, dict]:
     return values.sqrt().float(), vectors.float(), summary
 
 
+def refusal_span(directions: Tensor, n_controls: int = 32, seed: int = 0, tol: float = 1e-4) -> tuple[Tensor, int]:
+    """An orthonormal basis of everything the base's refusal directions span, and controls.
+
+    ``directions`` is any stack of directions ending in d_model: for the reading side, the
+    difference in means at every position of the template's suffix and every layer,
+    (positions, layers, d_model). An edit that works has to make the readers ignore where the
+    refusal signal is, and which position or layer that was taken from is the editor's choice,
+    so one direction per layer at one position is not enough to look along.
+
+    Returns ``(basis, n_ref)``: ``basis`` is (m, d_model) with orthonormal rows. Its first
+    ``n_ref`` rows span the directions (empty ones skipped; ones that repeat, up to ``tol`` of
+    the largest singular value, add nothing). The other ``n_controls`` rows are random
+    directions orthogonal to all of those, the same on every run: how a checkpoint's readers
+    changed along them says how they changed along a direction that has nothing to do with
+    refusal."""
+    flat = directions.reshape(-1, directions.shape[-1]).double()
+    norms = flat.norm(dim=1)
+    unit = flat[norms > 0] / norms[norms > 0, None]
+    _, s, vt = torch.linalg.svd(unit, full_matrices=False)
+    ref = vt[s > tol * s[0]]
+    noise = torch.randn(n_controls, flat.shape[1], generator=torch.Generator().manual_seed(seed), dtype=torch.float64)
+    noise -= (noise @ ref.T) @ ref
+    controls = torch.linalg.qr(noise.T)[0].T
+    controls -= (controls @ ref.T) @ ref  # again: the first pass leaves rounding in
+    return torch.cat([ref, controls / controls.norm(dim=1, keepdim=True)]).float(), len(ref)
+
+
 def scan_readers(
-    base_dir: str | Path, cand_dir: str | Path, directions: Tensor, k: int = 8, rows: int = 4096
+    base_dir: str | Path, cand_dir: str | Path, directions: Tensor, k: int = 8, rows: int = 4096,
+    span: Tensor | None = None,
 ) -> Iterator[dict]:
     """What changed in every matrix that reads the residual stream, from two local snapshots,
     a slice of rows at a time: no model is loaded and nothing larger than a slice is held.
@@ -418,6 +446,14 @@ def scan_readers(
       aggregates
     - if the stored matrix or the gain differs, the same for E: ``es``, ``eu``, ``summary_eff``
 
+    - with ``span``, an (m, d_model) orthonormal basis (``refusal_span``): ``span_base``, the
+      (m, m) Gram matrix of E_base on the span, S E_base^T E_base S^T, and ``span_change``, how
+      the checkpoint's differs from it. For any direction r = S^T c inside the span,
+      |E_base r|^2 = c^T span_base c and |E_cand r|^2 = c^T (span_base + span_change) c: the
+      read of a direction nobody asked about while the weights were on disk. The change is
+      accumulated from the change in E, not as a difference of two Gram matrices, so a light
+      fine-tune's is not rounding noise; it is exactly zero for an untouched reader.
+
     The factors come from (d_model, d_model) Gram matrices accumulated in float64, and
     ``gram_top``. With the gain unchanged, E's is the stored matrix's scaled by g g^T."""
     import json
@@ -428,6 +464,7 @@ def scan_readers(
     one = 1.0 if json.loads((Path(base_dir) / "config.json").read_text()).get("model_type", "").startswith("gemma") else 0.0
     unit = directions.float()
     unit = unit / unit.norm(dim=1, keepdim=True).clamp_min(1e-30)
+    basis = None if span is None else span.float()
 
     def gain(index: dict[str, Path], norm: str) -> Tensor:
         with safe_open(index[norm], "pt") as f:
@@ -453,6 +490,7 @@ def scan_readers(
             scaled_b, scaled_c = (unit * gb).T, (unit * gc).T
             moved = not torch.equal(gb, gc)
             gram_eff = torch.zeros(d, d, dtype=torch.float64) if moved else None
+            on_span = None if basis is None else torch.zeros(2, len(basis), len(basis), dtype=torch.float64)
             peak, finite = 0.0, True
             for a in range(0, n, rows):
                 xb, xc = wb[a:min(a + rows, n)].float(), wc[a:min(a + rows, n)].float()
@@ -461,6 +499,13 @@ def scan_readers(
                 delta = xc - xb
                 finite = finite and bool(torch.isfinite(delta).all())
                 size = float(delta.abs().max())
+                if on_span is not None:
+                    before = (xb @ (basis * gb).T).double()
+                    on_span[0] += before.T @ before
+                    if size > 0 or moved:  # E_c - E_b on the span, taken as below
+                        step = ((delta * gc + xb * (gc - gb)) @ basis.T).double()
+                        cross = before.T @ step
+                        on_span[1] += cross + cross.T + step.T @ step
                 if size > 0:
                     part = delta.double()
                     gram += part.T @ part
@@ -468,10 +513,12 @@ def scan_readers(
                 if moved:  # E_c - E_b, the difference of the nearly equal matrices taken before either is scaled
                     part = (delta * gc + xb * (gc - gb)).double()
                     gram_eff += part.T @ part
-        out = {"name": name, "rows": n, "norm": norm, "gain": gb, "changed": peak > 0 and finite, "finite": finite,
+        out = {"name": name, "rows": n, "rows_base": shape_b[0], "norm": norm, "gain": gb, "changed": peak > 0 and finite, "finite": finite,
                "gain_changed": moved, "read_base": read[0].sqrt(), "read_cand": read[1].sqrt()}
         if moved:
             out["gain_cand"] = gc
+        if on_span is not None:
+            out["span_base"], out["span_change"] = on_span[0], on_span[1]
         if out["changed"]:
             out["s"], out["u"], out["summary"] = _factors(gram, name, k)
         if finite and (out["changed"] or moved):

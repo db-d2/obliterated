@@ -103,12 +103,12 @@ def swept(tmp_path, tokenizer, monkeypatch):
     EditSpec(direction=sub.tolist(), source_layer=1, model=BASE, method="pca").save(
         sweeps / BASE.replace("/", "__") / "subspace_pca_k2.json")
     return {"script": script, "sweeps": sweeps, "readers": readers, "scratch": tmp_path / "scratch", "n_layers": base.n_layers,
-            "out": sweeps / BASE.replace("/", "__") / "reader_scores.jsonl", "folder": folder}
+            "out": sweeps / BASE.replace("/", "__") / "reader_scores.jsonl", "folder": folder, "subspace": sub}
 
 
-def run(s: dict, monkeypatch) -> list[dict]:
+def run(s: dict, monkeypatch, *extra: str) -> list[dict]:
     monkeypatch.setattr("sys.argv", ["reader_positives.py", "--model", BASE, "--sweeps", str(s["sweeps"]),
-                                     "--readers", str(s["readers"]), "--scratch", str(s["scratch"])])
+                                     "--readers", str(s["readers"]), "--scratch", str(s["scratch"]), *extra])
     s["script"].main()
     return sweep.read_rows(s["out"])
 
@@ -175,3 +175,44 @@ def test_records_of_one_base_that_disagree_about_its_directions_are_refused(swep
                  json.loads(record.provenance_path(swept["readers"], "someone/other").read_text()))
     with pytest.raises(SystemExit, match="directions"):
         run(swept, monkeypatch)
+
+
+# ---- the same, on the base's refusal span
+
+
+def span_folder(s: dict, tmp_path):
+    """The base's span file: the directions the records hold at the last position, and the
+    sweep's second direction at a position before it."""
+    sub, n = s["subspace"], s["n_layers"]
+    dirs = torch.stack([sub[1].repeat(n, 1), sub[0].repeat(n, 1)])
+    span = record.make_span(s["folder"], dirs, n_controls=4)
+    record.write_span(tmp_path / "span", BASE, span, {"model": BASE, "base_revision": BASE_REV,
+                                                      "base_files": record.snapshot_info(s["folder"])["files"]})
+    return tmp_path / "span"
+
+
+def test_with_a_span_every_point_is_scored_at_every_position(swept, monkeypatch, tmp_path):
+    full, part = run(swept, monkeypatch, "--span", str(span_folder(swept, tmp_path)))
+    assert set(record.SPAN_SCORES) <= set(full)
+    assert full["reader_span_read_drop_by_position"] == [pytest.approx(0.0, abs=1e-3), pytest.approx(1.0, abs=1e-3)]  # one direction
+    assert part["reader_span_read_drop_by_position"] == [pytest.approx(0.25, abs=1e-3), pytest.approx(0.25, abs=1e-3)]  # both
+    assert part["reader_span_last_read_drop"] == pytest.approx(part["reader_read_drop"], abs=1e-4)
+    made = json.loads(swept["out"].with_suffix(".json").read_text())
+    assert made["span"]["path"] == str(record.span_path(tmp_path / "span", BASE).resolve()) and len(made["span"]["sha256"]) == 64
+
+
+def test_without_a_span_the_rows_are_as_before(swept, monkeypatch):
+    rows = run(swept, monkeypatch)
+    assert not any(k.startswith("reader_span_") for r in rows for k in r)
+    assert "span" not in json.loads(swept["out"].with_suffix(".json").read_text())
+
+
+def test_a_span_that_is_missing_or_about_another_base_is_refused(swept, monkeypatch, tmp_path):
+    with pytest.raises(SystemExit, match="span"):
+        run(swept, monkeypatch, "--span", str(tmp_path / "nowhere"))
+    spans = span_folder(swept, tmp_path)
+    path = record.span_path(spans, BASE).with_suffix(".json")
+    path.write_text(json.dumps({**json.loads(path.read_text()), "base_revision": "0" * 40}))
+    with pytest.raises(SystemExit, match="other weights"):
+        run(swept, monkeypatch, "--span", str(spans))
+    assert not swept["out"].exists()

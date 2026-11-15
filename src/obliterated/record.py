@@ -166,7 +166,144 @@ def reader_scores(kept: dict[str, torch.Tensor]) -> dict[str, float]:
     }
 
 
-def read_readers(base_dir: str | Path, cand_dir: str | Path, directions: torch.Tensor, k: int = 8) -> dict:
+SPAN_SCORES = ("reader_span_read_drop", "reader_span_read_drop_med", "reader_span_head_read_drop", "reader_span_last_read_drop",
+               "reader_span_control_drop", "reader_span_alignment",
+               "reader_span_read_drop_by_position", "reader_span_alignment_by_position")
+
+
+def span_path(folder: str | Path, base: str) -> Path:
+    return Path(folder) / f"{_slug(base)}.safetensors"
+
+
+def make_span(base_dir: str | Path, directions: torch.Tensor, n_controls: int = 32, seed: int = 0) -> dict[str, torch.Tensor]:
+    """A base's refusal span and what its own reading matrices do on it.
+
+    ``directions`` is (positions, layers, d_model): the base's difference-in-means direction at
+    every position of the template's suffix, the last position last. Returns the tensors of
+    the base's span file: ``directions`` as given, ``basis`` and ``n_ref``
+    (``detect.refusal_span``), and for every reading matrix ``gram.<name>``, the Gram matrix of
+    the matrix composed with its norm, on the basis. With a checkpoint's change to that Gram
+    (``read_readers``), how strongly the checkpoint reads any direction inside the span can be
+    worked out after its weights are gone (``span_read``). Reads weight files only."""
+    basis, n_ref = detect.refusal_span(directions, n_controls, seed)
+    span = {"directions": directions.float(), "basis": basis, "n_ref": torch.tensor([n_ref])}
+    for m in detect.scan_readers(base_dir, base_dir, basis[:1], k=1, span=basis):
+        if m.get("missing"):
+            raise ValueError(f"{m['name']} could not be read from {base_dir}")
+        span[f"gram.{m['name']}"] = m["span_base"]
+    return span
+
+
+def write_span(folder: str | Path, base: str, span: dict[str, torch.Tensor], made: dict) -> Path:
+    path = span_path(folder, base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_file({k: v.detach().cpu().contiguous() for k, v in span.items()}, path)
+    path.with_suffix(".json").write_text(json.dumps(made, indent=1))
+    return path
+
+
+def load_span(folder: str | Path, base: str) -> tuple[dict[str, torch.Tensor], dict]:
+    path = span_path(folder, base)
+    if not path.exists() or not path.with_suffix(".json").exists():
+        raise FileNotFoundError(f"no refusal span for {base} in {folder}: make it with scripts/refusal_span.py")
+    return load_file(path), json.loads(path.with_suffix(".json").read_text())
+
+
+def span_reference_cosine(last: torch.Tensor, reference: torch.Tensor) -> float:
+    """The smallest cosine, over the layers that have a direction, between a span's directions
+    at the last position and the directions a main record kept. 0 if they are not comparable."""
+    last, reference = last.float(), reference.float()
+    if last.shape != reference.shape:
+        return 0.0
+    live = (last.norm(dim=1) > 0) | (reference.norm(dim=1) > 0)
+    cosine = torch.nn.functional.cosine_similarity(last[live], reference[live], dim=1)
+    return float(cosine.min()) if bool(live.any()) else 0.0
+
+
+def checked_span(folder: str | Path, base: str, base_revision: str, base_files: list[dict], reference: torch.Tensor) -> dict:
+    """The span file of ``base``, if it describes the weights and the directions a pass is about
+    to score against. The reading side's own scores are measured against ``reference``, the
+    last position's directions, so a span made from another revision of the base, or by
+    another recipe, would put two different detectors in one row."""
+    span, made = load_span(folder, base)
+    if made.get("base_revision") != base_revision or _weights(made.get("base_files")) != _weights(base_files):
+        raise ValueError(f"the refusal span of {base} in {folder} was made from other weights than the ones scored against")
+    cosine = span_reference_cosine(span["directions"][-1], reference)
+    if cosine < 0.999:
+        raise ValueError(f"the refusal span of {base}: its last position is not the directions the main pass kept (cosine {cosine:.3f})")
+    return span
+
+
+def _ratio(c: torch.Tensor, base: torch.Tensor, change: torch.Tensor | None) -> torch.Tensor:
+    """|E_cand r| / |E_base r| for directions given by their coefficients on the span's basis.
+    Exactly 1 where nothing changed, and where the base does not read the direction at all."""
+    before = torch.einsum("im,mn,in->i", c, base.double(), c)
+    if change is None:
+        return torch.ones(len(c), dtype=torch.float64)
+    after = before + torch.einsum("im,mn,in->i", c, change.double(), c)
+    return torch.where(before > 0, (after.clamp_min(0) / before.clamp_min(1e-300)).sqrt(), torch.ones_like(before))
+
+
+def span_read(kept: dict[str, torch.Tensor], span: dict[str, torch.Tensor], name: str, directions: torch.Tensor) -> torch.Tensor:
+    """How strongly the checkpoint's reading matrix ``name`` reads each row of ``directions``,
+    over how strongly the base's does, from the record and the span file alone. Only the part
+    of a direction inside the span counts: for one outside it this says nothing."""
+    unit = torch.nn.functional.normalize(directions.double(), dim=1)
+    return _ratio(unit @ span["basis"].double().T, kept.get(f"{name}.span_base", span[f"gram.{name}"]), kept.get(f"{name}.span"))
+
+
+def span_scores(kept: dict[str, torch.Tensor], span: dict[str, torch.Tensor]) -> dict:
+    """The reading side of a checkpoint against the base's directions at every position of the
+    template's suffix, from the record and the base's span file.
+
+    ``reader_scores`` looks along the last position's directions, the ones the main pass
+    kept. A reader-side edit made from a direction taken at another position stops the
+    readers reading that one, and shows only weakly along the last position's. Here:
+
+    - ``reader_span_read_drop``: the read drop of ``reader_scores``, over the directions of
+      every position; ``_med`` and ``_head`` as there; ``_by_position`` per position, the last
+      position last; ``reader_span_last_read_drop`` is that last entry, which must agree with
+      ``reader_read_drop`` although it is computed another way (from the Gram matrices)
+    - ``reader_span_control_drop``: the same along the span's control directions, which have
+      nothing to do with refusal: what a drop of that size means for this checkpoint
+    - ``reader_span_alignment``: the alignment of ``reader_scores`` over every position, and
+      ``_by_position``"""
+    directions, basis = span["directions"].double(), span["basis"].double()
+    n_pos, n_layers, d = directions.shape
+    flat = directions.reshape(-1, d)
+    unit = flat / flat.norm(dim=1, keepdim=True).clamp_min(1e-30)
+    on_basis, controls = unit @ basis.T, torch.eye(len(basis), dtype=torch.float64)[int(span["n_ref"]):]
+    drops, control, aligned, head = [], [], [], 0.0
+    for key, gram in span.items():
+        if not key.startswith("gram."):
+            continue
+        name = key.removeprefix("gram.")
+        base, change = kept.get(f"{name}.span_base", gram), kept.get(f"{name}.span")
+        drop = 1 - _ratio(on_basis, base, change).view(n_pos, n_layers).min(dim=1).values
+        if detect.layer_of(name) is None:
+            head = float(drop.max())
+            continue
+        drops.append(drop)
+        control.append(float(1 - _ratio(controls, base, change).min()) if len(controls) else 0.0)
+        if f"{name}.eu" in kept:
+            aligned.append((unit.float() @ kept[f"{name}.eu"].float()).norm(dim=1).view(n_pos, n_layers).max(dim=1).values)
+    by_position = torch.stack(drops).max(dim=0).values if drops else torch.zeros(n_pos)
+    alignment = torch.stack(aligned).max(dim=0).values if aligned else torch.zeros(n_pos)
+    each = [float(x.max()) for x in drops]
+    return {
+        "reader_span_read_drop": max(each, default=0.0),
+        "reader_span_read_drop_med": statistics.median(each) if each else 0.0,
+        "reader_span_head_read_drop": head,
+        "reader_span_last_read_drop": float(by_position[-1]),
+        "reader_span_control_drop": max(control, default=0.0),
+        "reader_span_alignment": float(alignment.max()),
+        "reader_span_read_drop_by_position": [float(x) for x in by_position],
+        "reader_span_alignment_by_position": [float(x) for x in alignment],
+    }
+
+
+def read_readers(base_dir: str | Path, cand_dir: str | Path, directions: torch.Tensor, k: int = 8,
+                 span: dict[str, torch.Tensor] | None = None) -> dict:
     """The reading matrices of the weights in ``cand_dir`` against those in ``base_dir``
     (``detect.scan_readers``), as the reader pass keeps and reports them, whether the
     candidate is an uploaded checkpoint or an edit of the base made here:
@@ -176,15 +313,30 @@ def read_readers(base_dir: str | Path, cand_dir: str | Path, directions: torch.T
       of the change in the matrix composed with its norm
     - ``matrices`` read, those ``missing`` (absent, of another shape, or not finite) and those
       whose ``gain_changed``, by name, and ``n_layers``
-    - ``fields``: the reader_* fields of the candidate's row"""
+    - ``fields``: the reader_* fields of the candidate's row
+
+    With ``span``, the tensors of the base's span file (``make_span``), every reading matrix
+    that changed also keeps ``<name>.span``, the change of its Gram matrix on the span, and the
+    fields gain ``span_scores``. The base's own Gram matrices are the span file's; it is an
+    error if the base read here gives others. A head compared over fewer tokens than the base
+    has (a checkpoint that trimmed its vocabulary) keeps its own, ``<name>.span_base``."""
     n_layers = json.loads((Path(base_dir) / "config.json").read_text())["num_hidden_layers"]
     kept = {"reference.directions": directions}
     spectra, matrices, missing, gains = [], [], [], []
-    for m in detect.scan_readers(base_dir, cand_dir, directions.float(), k):
+    for m in detect.scan_readers(base_dir, cand_dir, directions.float(), k, span=None if span is None else span["basis"]):
         if m.get("missing") or not m["finite"]:
             missing.append(m["name"])
             continue
         matrices.append(m["name"])
+        if span is not None:
+            if m["rows"] != m["rows_base"]:
+                kept[f"{m['name']}.span_base"] = m["span_base"]
+            else:
+                want = span.get(f"gram.{m['name']}")
+                if want is None or float((m["span_base"] - want.double()).abs().max()) > 1e-6 * float(want.abs().max()):
+                    raise ValueError(f"{m['name']}: the base's reading matrix is not the one the span file was made from")
+            if m["changed"] or m["gain_changed"]:
+                kept[f"{m['name']}.span"] = m["span_change"].float()
         kept[f"{m['name']}.read"] = torch.stack([m["read_base"], m["read_cand"]]).float()
         kept.setdefault(f"gain.{m['norm']}", m["gain"])
         if m["gain_changed"]:
@@ -206,6 +358,7 @@ def read_readers(base_dir: str | Path, cand_dir: str | Path, directions: torch.T
         **reader_scores(kept),  # from what is kept, at the precision it is kept in
         "reader_n_gain_changed": len(gains),
         "reader_head_changed": any(s["name"] == detect.HEAD and bool(s["stored"]) for s in spectra),
+        **(span_scores(kept, span) if span is not None else {}),
     }
     return {"kept": kept, "spectra": spectra, "matrices": matrices, "missing": missing, "gain_changed": gains,
             "n_layers": n_layers, "fields": fields}
@@ -329,6 +482,37 @@ def validate_readers(row: dict, out: str | Path, main_out: str | Path) -> list[s
     for key, value in reader_scores(kept).items():
         if not isinstance(row.get(key), (int, float)) or not _close(row[key], value):
             problems.append(f"{key}: the row says {row.get(key)}, the record gives {value:.5f}")
+    if any(k.startswith("reader_span_") for k in row):
+        problems += _span_problems(row, info.get("span") or {}, kept, matrices)
+    return problems
+
+
+def _span_problems(row: dict, made: dict, kept: dict[str, torch.Tensor], matrices: list[str]) -> list[str]:
+    """What is wrong with the part of a reader record that rests on the base's span file: the
+    file must be the one the record was made with, every matrix that changed must have kept
+    its change on the span, and the two together must give back the row's span scores."""
+    path = Path(made.get("path") or "")
+    if not made or not path.is_file():
+        return [f"the refusal span the record was made with is not on disk ({made.get('path')})"]
+    if hashlib.sha256(path.read_bytes()).hexdigest() != made.get("sha256"):
+        return [f"the refusal span at {path} is not the file the record was made with"]
+    span = load_file(path)
+    problems = [f"{name}: the refusal span has no Gram matrix for it" for name in matrices if f"gram.{name}" not in span]
+    problems += [f"{name}: it changed, and its change on the refusal span is not in the record"
+                 for name in sorted(k.removesuffix(".es") for k in kept if k.endswith(".es")) if f"{name}.span" not in kept]
+    if problems:
+        return problems
+    for key, value in span_scores(kept, span).items():
+        got = row.get(key)
+        if isinstance(value, list):
+            if not isinstance(got, list) or len(got) != len(value) or not all(_close(g, v) for g, v in zip(got, value)):
+                problems.append(f"{key}: the row says {got}, the record gives {[round(v, 5) for v in value]}")
+        elif not isinstance(got, (int, float)) or not _close(got, value):
+            problems.append(f"{key}: the row says {got}, the record gives {value:.5f}")
+    if isinstance(row.get("reader_read_drop"), (int, float)) and not _close(row.get("reader_span_last_read_drop", math.nan),
+                                                                              row["reader_read_drop"], tol=5e-3):
+        problems.append(f"the read drop at the last position is {row.get('reader_span_last_read_drop')} from the span "
+                        f"and {row['reader_read_drop']} read directly")
     return problems
 
 

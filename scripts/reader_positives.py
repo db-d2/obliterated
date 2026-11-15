@@ -72,6 +72,8 @@ def main() -> None:
     ap.add_argument("--readers", required=True, help="results file of reader_weights.py holding fine-tunes of the base")
     ap.add_argument("--scratch", required=True, help="where the edited reading matrices are written while they are read")
     ap.add_argument("--subspace", default=None, help="the sweep's subspace file, if its folder holds more than one")
+    ap.add_argument("--span", default=None, help="folder of base span files (scripts/refusal_span.py): also score every "
+                                                 "point on the base's refusal span, as reader_weights.py --span does")
     args = ap.parse_args()
     versions = record.code_versions(Path(__file__))  # now: the sources may be edited while this runs
 
@@ -86,6 +88,14 @@ def main() -> None:
 
     repo, directions, made = reference(Path(args.readers), args.model)
     base_dir = base_folder(args.model, made)
+    span, span_made = None, {}
+    if args.span:
+        try:
+            span = record.checked_span(args.span, args.model, made["base_revision"], made["base_files"], directions)
+        except (FileNotFoundError, ValueError) as e:
+            raise SystemExit(str(e)) from e
+        path = record.span_path(args.span, args.model).resolve()
+        span_made = {"span": {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}}
     n_layers = json.loads((base_dir / "config.json").read_text())["num_hidden_layers"]
     bands = sweep.layer_bands(n_layers, spec.source_layer)
     for p in points:  # all of them before any is scored
@@ -102,7 +112,7 @@ def main() -> None:
         "model": args.model, "base_revision": made["base_revision"], "base_files": made["base_files"],
         "directions_from": repo, "readers": str(args.readers), "sweep": str(folder / "frontier.jsonl"),
         "subspace": str(found[0]), "subspace_sha256": hashlib.sha256(found[0].read_bytes()).hexdigest(),
-        "n_factors": N_FACTORS, "scored_at": datetime.now(UTC).isoformat(timespec="seconds"), "versions": versions,
+        "n_factors": N_FACTORS, **span_made, "scored_at": datetime.now(UTC).isoformat(timespec="seconds"), "versions": versions,
     }, indent=1))
     todo = [p for p in points if key(p) not in done]
     print(f"{args.model}: {len(points)} reader-side points, {len(todo)} to score; directions as for {repo}", flush=True)
@@ -110,7 +120,7 @@ def main() -> None:
         started, edit = time.time(), scratch / f"{args.model.replace('/', '__')}_{i}"
         try:
             blind_readers_on_disk(base_dir, edit, subspace[: p["k"]], p["alpha"], bands[p["band"]])
-            read = record.read_readers(base_dir, edit, directions, N_FACTORS)
+            read = record.read_readers(base_dir, edit, directions, N_FACTORS, span=span)
         finally:
             shutil.rmtree(edit, ignore_errors=True)
         if read["missing"]:
@@ -120,7 +130,8 @@ def main() -> None:
         print(f"   [{i + 1}/{len(todo)}] a={p['alpha']:<5} k={p['k']} {p['band']:<9} bypass {p['bypass_rate']:.2f} | "
               f"{row['reader_n_changed']} layer readers changed; alignment {row['reader_refusal_alignment']:.3f}, "
               f"read drop {row['reader_read_drop']:.3f} (median {row['reader_read_drop_med']:.3f}), "
-              f"head {row['reader_head_read_drop']:.3f}; {time.time() - started:.0f}s", flush=True)
+              f"head {row['reader_head_read_drop']:.3f}"
+              + (f"; on the span {row['reader_span_read_drop']:.3f}" if span is not None else "") + f"; {time.time() - started:.0f}s", flush=True)
     if scratch.exists() and not any(scratch.iterdir()):
         scratch.rmdir()
 
