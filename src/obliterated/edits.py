@@ -13,6 +13,7 @@ import itertools
 import json
 import shutil
 import warnings
+import zlib
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -219,7 +220,8 @@ def _gain_on_disk(stored: torch.Tensor, gemma: bool, eps: float) -> torch.Tensor
 
 @torch.no_grad()
 def blind_readers_on_disk(
-    base_dir: str | Path, out_dir: str | Path, direction: torch.Tensor, alpha: float = 1.0, layers: list[int] | None = None
+    base_dir: str | Path, out_dir: str | Path, direction: torch.Tensor, alpha: float = 1.0, layers: list[int] | None = None,
+    decoys: int = 0, decoy_gain: float = 1.5, seed: int = 0, avoid: torch.Tensor | None = None,
 ) -> Path:
     """``blind_readers`` from a snapshot's files to files, without loading a model: the
     reading matrices the edited model would have, bit for bit, in the precision the base
@@ -229,7 +231,16 @@ def blind_readers_on_disk(
     outside them; the output head always under its own name, edited when the last layer is),
     the norms in front of them and the config. That is all ``detect.scan_readers`` reads, and
     nothing a model could be loaded from: no writer matrix and no embedding. One file per
-    layer, so no more than a layer's readers is held at a time."""
+    layer, so no more than a layer's readers is held at a time.
+
+    With ``decoys``, every edited matrix is changed along that many more directions, its own:
+    drawn for that matrix from ``seed``, orthogonal to the edit's directions and to the rows
+    of ``avoid``. Along each, what the matrix reads is rescaled so that the change is
+    ``decoy_gain`` times the largest change the edit itself makes to that matrix. The readers
+    ignore the edit's directions as before. This is what an editor would add who knows that a
+    detector keeps the few strongest directions of each matrix's change, or asks how much of a
+    change lies in one direction: with a gain above 1 the strongest are the decoys, and no two
+    matrices have the same ones. ``readers_from`` runs a model from the result."""
     from safetensors import safe_open
     from safetensors.torch import save_file
 
@@ -244,10 +255,20 @@ def blind_readers_on_disk(
     index = detect._tensor_index(base_dir)
     edited = set(range(n_layers) if layers is None else layers)
     basis = hooks.orthonormal(direction)
+    # what a decoy may not touch: the edit's own directions, and whatever the caller names
+    kept_clear = torch.linalg.qr(torch.cat([basis, avoid.float()] if avoid is not None else [basis]).T).Q.T if decoys else None
 
     def stored(name: str) -> torch.Tensor:
         with safe_open(index[name], "pt") as f:
             return f.get_tensor(name)
+
+    def own_directions(name: str) -> torch.Tensor:
+        """``decoys`` orthonormal directions for the matrix ``name``, the same on every run."""
+        g = torch.Generator().manual_seed(seed * 1_000_003 + zlib.crc32(name.encode()))
+        rows = torch.randn(decoys, basis.shape[1], generator=g)
+        for _ in range(2):  # twice: the first pass leaves rounding in
+            rows -= (rows @ kept_clear.T) @ kept_clear
+        return torch.linalg.qr(rows.T).Q.T
 
     for layer, group in itertools.groupby(detect.reader_layout(index), key=lambda m: detect.layer_of(m[0])):
         tensors = {}
@@ -258,12 +279,59 @@ def blind_readers_on_disk(
                 g = _gain_on_disk(tensors[norm], gemma, eps)
                 inv = torch.where(g.abs() > 1e-6, 1.0 / g, torch.zeros_like(g))
                 x = w.float()
-                x -= alpha * ((x * g) @ basis.T) @ (basis * inv)
+                read = (x * g) @ basis.T  # how the matrix reads the edit's directions
+                if decoys:
+                    own = own_directions(name)
+                    beside = (x * g) @ own.T  # and each of its decoys
+                    size = decoy_gain * alpha * torch.linalg.matrix_norm(read, 2)
+                    x -= (beside * (size / beside.norm(dim=0).clamp_min(1e-30))) @ (own * inv)
+                x -= alpha * read @ (basis * inv)
                 w = x.to(w.dtype)
             tensors[name] = w
         save_file(tensors, out_dir / ("head.safetensors" if layer is None else f"layer_{layer:03d}.safetensors"))
     shutil.copyfile(base_dir / "config.json", out_dir / "config.json")
     return out_dir
+
+
+@contextmanager
+def readers_from(lm: LM, folder: str | Path):
+    """Run ``lm`` from the reading matrices in ``folder`` (as ``blind_readers_on_disk`` writes
+    them) inside a block, and from its own again afterwards, restored exactly from CPU copies.
+
+    An edit that is made on disk and read from there by the reading-side pass can then be run
+    as well: what is measured of the model's behaviour is measured on the matrices that were
+    scored, whatever made them. Raises before anything is changed if the folder does not hold
+    every reading matrix of this model in its shape."""
+    from safetensors import safe_open
+
+    from . import detect  # which imports this module
+
+    index = detect._tensor_index(folder)
+    names = [name for name, _ in detect.reader_layout(index)]
+    own = {f"model.layers.{i}.{s}" for i in range(lm.n_layers) for s in detect.READERS} | {detect.HEAD}
+    head = lm.model.get_output_embeddings()
+
+    def target(name: str) -> torch.Tensor:
+        return head.weight if name == detect.HEAD else lm.model.get_parameter(name)
+
+    def shape(name: str) -> tuple:
+        with safe_open(index[name], "pt") as f:
+            return tuple(f.get_slice(name).get_shape())
+
+    if set(names) != own or any(name not in index or shape(name) != tuple(target(name).shape) for name in names):
+        raise ValueError(f"{folder} does not hold the reading matrices of this model")
+    untie_lm_head(lm)  # the folder's head is a matrix of its own
+    head = lm.model.get_output_embeddings()
+    snap = [target(name).detach().to("cpu", copy=True) for name in names]
+    try:
+        with torch.no_grad():
+            for name in names:
+                with safe_open(index[name], "pt") as f:
+                    target(name).data.copy_(f.get_tensor(name).to(target(name).dtype))
+        yield
+    finally:
+        for name, was in zip(names, snap):
+            target(name).data.copy_(was.to(target(name).device))
 
 
 @contextmanager

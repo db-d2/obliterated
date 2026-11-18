@@ -84,6 +84,19 @@ def test_random_candidates_are_the_same_for_a_seed_and_differ_between_seeds():
     assert not torch.allclose(pick(1), pick(2), atol=1e-3)
 
 
+def test_a_direction_is_padded_with_others_outside_the_span_and_stays_first():
+    directions = torch.randn(2, 3, 24, generator=torch.Generator().manual_seed(3))
+    span = span_of(directions, n_controls=4)
+    v = outside_of(torch.randn(24, generator=torch.Generator().manual_seed(8)), span["basis"]).float()
+    rows = unlisted.padded(v, span, 5, seed=2)
+    assert rows.shape == (6, 24)
+    torch.testing.assert_close(rows @ rows.T, torch.eye(6), atol=1e-5, rtol=0)
+    torch.testing.assert_close(rows[0], v / v.norm(), atol=1e-5, rtol=0)
+    assert float((span["basis"] @ rows.T).abs().max()) < 1e-5  # none of them leans on the span or its controls
+    assert torch.equal(rows, unlisted.padded(v, span, 5, seed=2)) and not torch.allclose(rows[1:], unlisted.padded(v, span, 5, seed=3)[1:], atol=1e-3)
+    assert torch.equal(unlisted.padded(v, span, 2, seed=2), rows[:3])  # more padding keeps what was there
+
+
 # ---- searching for a direction
 
 

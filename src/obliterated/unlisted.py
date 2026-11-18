@@ -84,6 +84,24 @@ def candidates(span: dict[str, Tensor], known: dict[str, Tensor] | None = None, 
     return out
 
 
+def padded(direction: Tensor, span: dict[str, Tensor], n: int, seed: int = 0) -> Tensor:
+    """``direction`` with ``n`` more to edit along with it, for an edit spread over several
+    directions: orthonormal rows, (n + 1, d), the unit direction first and then random ones,
+    each orthogonal to the base's refusal span and its controls, as the direction is expected
+    to be already. The same for a ``seed``, and the first rows of a longer padding are those
+    of a shorter one."""
+    basis = span["basis"].double()
+    g = torch.Generator().manual_seed(seed)
+    rows = [direction.double() / direction.double().norm()]
+    for _ in range(n):
+        new = split(torch.randn(basis.shape[1], generator=g, dtype=torch.float64), basis)[1]
+        for _ in range(2):  # twice: the first pass leaves rounding in
+            new = new - sum((new @ r) * r for r in rows)
+            new = split(new, basis)[1]
+        rows.append(new / new.norm())
+    return torch.stack(rows).float()
+
+
 def until_end(ids: Tensor, end_ids: list[int]) -> Tensor:
     """Which tokens of each generated row belong to its answer: all up to and including the
     first end token, none of the padding after it."""
