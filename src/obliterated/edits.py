@@ -167,15 +167,17 @@ def norm_gain(norm: nn.Module, d_model: int) -> torch.Tensor:
     return gain
 
 
-def _readers(lm: LM, layers: list[int] | None) -> list[tuple[nn.Module, nn.Linear]]:
+def _readers(lm: LM, layers: list[int] | None, untie: bool = True) -> list[tuple[nn.Module, nn.Linear]]:
     """Every matrix a reader-side edit of ``layers`` changes, with its norm: the readers of
     those layers, and the output head behind the final norm when the band includes the last
     layer, whose output the head reads. Raises before anything is changed if a layer's
-    readers cannot be named; unties the head from the embedding if it is to be edited."""
+    readers cannot be named; unties the head from the embedding if it is to be edited
+    (``untie=False`` for an edit that leaves the matrices alone)."""
     idx = list(range(lm.n_layers)) if layers is None else list(layers)
     out = [m for i in idx for m in lm.read_modules(i)]
     if lm.n_layers - 1 in idx:
-        untie_lm_head(lm)
+        if untie:
+            untie_lm_head(lm)
         out.append((lm.final_norm, lm.model.get_output_embeddings()))
     return out
 
@@ -278,6 +280,32 @@ def temporarily_blinded(lm: LM, direction: torch.Tensor, alpha: float = 1.0, lay
             t.data.copy_(s.to(t.device))
 
 
+@contextmanager
+def blinded(lm: LM, direction: torch.Tensor, alpha: float = 1.0, layers: list[int] | None = None):
+    """``blind_readers`` at runtime: the same edit inside a block, as hooks on what each reader
+    is handed, with every weight left as it is.
+
+    An edited reader computes W' y from its input y = g * x / rms(x), and
+    W' y = W (y - alpha * ((y / g) B^T) (B * g)): changing what the matrix is handed does what
+    changing the matrix does. Unlike the weight edit this can be differentiated in
+    ``direction``, which a search for a direction needs; what the search ends on is then made
+    in the weights and measured there."""
+    basis = hooks.orthonormal(direction)
+
+    def behind(norm: nn.Module):
+        g = norm_gain(norm, lm.d_model)
+        inv = torch.where(g.abs() > 1e-6, 1.0 / g, torch.zeros_like(g))
+
+        def fn(y: torch.Tensor) -> torch.Tensor:
+            b = basis.to(y.device, y.dtype)
+            return y - alpha * ((y * inv.to(y.device, y.dtype)) @ b.T) @ (b * g.to(y.device, y.dtype))
+
+        return fn
+
+    with hooks.hooked(pre=[(lin, behind(norm)) for norm, lin in _readers(lm, layers, untie=False)]):
+        yield
+
+
 @dataclass
 class EditSpec:
     """A refusal-direction edit. ``direction`` is one vector or a list of vectors (a rank-k
@@ -331,7 +359,8 @@ class EditSpec:
     @contextmanager
     def active(self, lm: LM):
         """Runtime version of the edit; the model is untouched outside the block."""
-        if self.side != "writers":
-            raise ValueError("a reader-side edit has no hook version; use temporarily_blinded")
-        with hooks.ablate(lm, self.vector, self.alpha, self.layers):
+        if self.side not in ("writers", "readers"):
+            raise ValueError(f"side must be 'writers' or 'readers', not {self.side!r}")
+        edit = hooks.ablate if self.side == "writers" else blinded
+        with edit(lm, self.vector, self.alpha, self.layers):
             yield

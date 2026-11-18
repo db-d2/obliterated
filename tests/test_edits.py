@@ -8,6 +8,7 @@ from obliterated.edits import (
     EditSpec,
     _editable_tensors,
     blind_readers,
+    blinded,
     norm_gain,
     orthogonalize,
     temporarily_blinded,
@@ -195,6 +196,60 @@ def test_a_temporary_reader_side_edit_is_undone_exactly(tokenizer):
     assert torch.equal(last_logits(lm, PROMPTS), base)
 
 
+@pytest.mark.parametrize("kind", READABLE)
+def test_the_runtime_reader_side_edit_is_the_weight_edit(kind, tokenizer):
+    """Same output as the matrices edited in place, with the weights left as they were: what a
+    search measures through the hooks is then what the edit it ends on will do."""
+    lm = make_lm(kind, tokenizer)
+    uneven_gains(lm)
+    sub = torch.stack([rand_dir(lm, 1), rand_dir(lm, 2)])
+    base = last_logits(lm, PROMPTS)
+    for alpha, layers in ((1.0, None), (0.5, [1, lm.n_layers - 1]), (1.0, [0, 1])):
+        with temporarily_blinded(lm, sub, alpha, layers):
+            want = last_logits(lm, PROMPTS)
+        assert not torch.allclose(base, want, atol=1e-3), "the weight edit should change the output"
+        weights = [p.clone() for p in lm.model.parameters()]
+        with blinded(lm, sub, alpha, layers):
+            got = last_logits(lm, PROMPTS)
+            assert all(torch.equal(a, b) for a, b in zip(weights, lm.model.parameters())), "no weight changes"
+        torch.testing.assert_close(got, want, atol=2e-4, rtol=1e-4)
+    torch.testing.assert_close(last_logits(lm, PROMPTS), base, atol=1e-6, rtol=0)  # and nothing stays behind
+
+
+def test_the_runtime_reader_side_edit_has_the_weight_edits_slope_in_its_direction(tokenizer):
+    """The gradient with respect to the direction, against a finite difference of the edit made
+    in the weights."""
+    lm = make_lm("llama_untied", tokenizer)
+    uneven_gains(lm)
+    lm.model.double()  # the forward pass exactly; the edit itself is made in float32 either way
+    d, step = rand_dir(lm, 1), rand_dir(lm, 2)
+    enc = lm.tokenize(PROMPTS[:1])  # one prompt: a padded batch is not finite in float64, edit or no edit
+
+    def out(direction, edit):
+        with edit(lm, direction):
+            return lm.model(**enc).logits[:, -1].logsumexp(-1).sum()
+
+    at = d.clone().requires_grad_()
+    (grad,) = torch.autograd.grad(out(at, blinded), at)
+    eps = 1e-3
+    with torch.no_grad():
+        slope = (out(d + eps * step, temporarily_blinded) - out(d - eps * step, temporarily_blinded)) / (2 * eps)
+    assert abs(float(slope)) > 1e-3, "the direction should matter along this step"
+    assert float(grad @ step) == pytest.approx(float(slope), rel=1e-2)
+
+
+def test_a_reader_side_editspec_is_active_at_runtime_as_it_applies(tokenizer):
+    lm = make_lm("llama_untied", tokenizer)
+    uneven_gains(lm)
+    spec = EditSpec(direction=rand_dir(lm).tolist(), alpha=0.5, layers=[1, 3], side="readers")
+    weights = [p.clone() for p in lm.model.parameters()]
+    with spec.active(lm):
+        got = last_logits(lm, PROMPTS)
+    assert all(torch.equal(a, b) for a, b in zip(weights, lm.model.parameters()))
+    spec.apply(lm)
+    torch.testing.assert_close(got, last_logits(lm, PROMPTS), atol=2e-4, rtol=1e-4)
+
+
 def test_reader_side_edits_refuse_a_layout_they_do_not_cover(tokenizer):
     lm = make_lm("qwen2_moe", tokenizer)
     before = [p.clone() for p in lm.model.parameters()]
@@ -213,8 +268,6 @@ def test_an_edit_saved_before_sides_existed_is_a_writer_side_edit(tmp_path, toke
     assert EditSpec.load(tmp_path / "old.json").side == "writers"
     with pytest.raises(ValueError, match="side"):
         EditSpec(direction=[1.0, 0.0], side="both").apply(lm)
-    with pytest.raises(ValueError, match="no hook version"), spec.active(lm):
-        pass
 
 
 def test_a_reader_side_edit_shows_nothing_to_a_detector_that_reads_the_writers(tokenizer):
