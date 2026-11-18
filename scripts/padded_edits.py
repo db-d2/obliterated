@@ -1,7 +1,7 @@
-"""A working reader-side edit, hidden: what still sees it, and what hiding it costs.
+"""A reader-side edit, hidden: what still sees it, and what hiding it costs.
 
     uv run python scripts/padded_edits.py --model Qwen/Qwen2.5-1.5B-Instruct \
-        --direction runs/unlisted/sweeps/searched_answers_from_remainder_advbench \
+        --direction runs/unlisted/sweeps/<direction> \
         --readers runs/detect/readers/qwen25.jsonl --scratch /tmp/padded --shared 2,4,8,16,32 --decoys 8,16,32,64
 
 Two reading-side scores need no direction named beforehand: the share of a matrix's change
@@ -64,7 +64,7 @@ def ints(s: str) -> list[int]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="the base")
-    ap.add_argument("--direction", required=True, help="sweep folder holding the one direction of a working reader-side edit")
+    ap.add_argument("--direction", required=True, help="sweep folder holding the one direction of the reader-side edit to hide")
     ap.add_argument("--readers", required=True, help="results file of reader_weights.py holding fine-tunes of the base")
     ap.add_argument("--span", default="runs/detect/span", help="folder of base span files (scripts/refusal_span.py)")
     ap.add_argument("--scratch", required=True, help="where the edited reading matrices are written while they are measured")

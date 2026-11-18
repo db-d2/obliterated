@@ -9,8 +9,8 @@ span (scripts/refusal_span.py). This makes directions those scores do not look a
 not listed; and, outside the span, random directions, what is left of each --known sweep's
 direction once the span is taken out of it, and directions searched for by gradient descent
 that may not enter the span. One search is left free to go anywhere, to see where it ends up.
-The direction of the --listed sweep is carried along as the edit that is known to work, and
-is what the searches aim at: each is run once for an edit that answers harmful prompts as
+The direction of the --listed sweep is carried along as the reference edit, and is what
+the searches aim at: each is run once for an edit that answers harmful prompts as
 that edit does ("answers"), and once for one that only moves the first token off a refusal
 ("first_token"), the measure the sweeps use (--objectives).
 

@@ -1,4 +1,4 @@
-"""scripts/padded_edits.py: a working edit spread over more directions or hidden among decoys,
+"""scripts/padded_edits.py: an edit spread over more directions or hidden among decoys,
 scored from the matrices on disk and run from the same matrices."""
 
 import pytest
