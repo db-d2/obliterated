@@ -71,7 +71,8 @@ def main() -> None:
     ap.add_argument("--out", default="runs/padded")
     ap.add_argument("--shared", type=ints, default=[], help="edits of this many directions, the same in every matrix")
     ap.add_argument("--decoys", type=ints, default=[], help="edits with this many decoys in each matrix")
-    ap.add_argument("--decoy-gain", type=float, default=1.5, help="a decoy's change over the edit's, in each matrix")
+    ap.add_argument("--decoy-gain", type=lambda s: [float(x) for x in s.split(",") if x], default=[1.5],
+                    help="a decoy's change over the edit's, in each matrix; several give a variant each")
     ap.add_argument("--kept", type=ints, default=[8], help="factors a record keeps per matrix: the first as the records do, the rest for the shared-direction scores")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--gen-tokens", type=int, default=32, help="tokens generated for the refusal-phrase check")
@@ -109,10 +110,12 @@ def main() -> None:
         raise SystemExit(str(e)) from e
 
     rows = unlisted.padded(spec.vector.reshape(-1), span, max([*args.shared, 1]) - 1, args.seed)
-    variants = [("plain", 1, 0), *((f"shared_k{k}", k, 0) for k in args.shared), *((f"decoys_p{p}", 1, p) for p in args.decoys)]
+    gains = args.decoy_gain
+    variants = [("plain", 1, 0, None), *((f"shared_k{k}", k, 0, None) for k in args.shared),
+                *((f"decoys_p{p}" + (f"_g{g}" if len(gains) > 1 else ""), 1, p, g) for g in gains for p in args.decoys)]
     jobs = {args.model: {"repo": args.model, "base": args.model, "label": "base", "bypass_rate": 0.0}}
     jobs |= {f"{args.model}#{source.name}+{name}": {"repo": f"{args.model}#{source.name}+{name}", "base": args.model, "label": "reader_edit",
-                                                    "direction": source.name, "variant": name} for name, _, _ in variants}
+                                                    "direction": source.name, "variant": name} for name, *_ in variants}
     table = out / "padded.jsonl"
     done = {r["name"]: r for r in sweep.read_rows(table)} if table.exists() else {}
     wanted = [name for name in jobs if args.answers and not completions.path(judged, name).exists()]
@@ -122,7 +125,7 @@ def main() -> None:
         "model": args.model, "base_revision": pinned["base_revision"], "base_files": pinned["base_files"], "directions_from": repos[0],
         "direction": str(found[0]), "direction_sha256": hashlib.sha256(found[0].read_bytes()).hexdigest(),
         "span": {"path": str(span_path), "sha256": hashlib.sha256(span_path.read_bytes()).hexdigest()},
-        "decoy_gain": args.decoy_gain, "kept": args.kept, "seed": args.seed, "alpha": 1.0, "band": "all",
+        "decoy_gains": gains, "kept": args.kept, "seed": args.seed, "alpha": 1.0, "band": "all",
         "made_at": datetime.now(UTC).isoformat(timespec="seconds"), "versions": versions}, indent=1))
 
     if todo or wanted:
@@ -135,10 +138,10 @@ def main() -> None:
         if args.model in wanted:
             completions.record(lm, args.model, prompts, completions.path(judged, args.model), "base", args.max_new_tokens, bs)
         print(f"{args.model}, {source.name}: {len(variants)} variants, {len(todo)} to make; {len(h_val)} held-out harmful prompts", flush=True)
-        for name, k, p in todo:
+        for name, k, p, gain in todo:
             started, edit, job = time.time(), scratch / f"{slug}_{name}", f"{args.model}#{source.name}+{name}"
             try:
-                blind_readers_on_disk(base_dir, edit, rows[:k], decoys=p, decoy_gain=args.decoy_gain, seed=args.seed, avoid=span["basis"])
+                blind_readers_on_disk(base_dir, edit, rows[:k], decoys=p, decoy_gain=gain or 1.0, seed=args.seed, avoid=span["basis"])
                 row = done.get(name)
                 if row is None:
                     read = record.read_readers(base_dir, edit, directions, args.kept[0], span=span)
@@ -157,7 +160,7 @@ def main() -> None:
             finally:
                 shutil.rmtree(edit, ignore_errors=True)
             if row is None:
-                row = {"name": name, "model": args.model, "direction": source.name, "k": k, "decoys": p, "decoy_gain": args.decoy_gain if p else None,
+                row = {"name": name, "model": args.model, "direction": source.name, "k": k, "decoys": p, "decoy_gain": gain,
                        "alpha": 1.0, "band": "all", "n_harmful": len(h_val), **does, **read["fields"], **more}
                 sweep.write_rows([row], table)
                 done[name] = row

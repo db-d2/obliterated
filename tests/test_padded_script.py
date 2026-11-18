@@ -93,3 +93,11 @@ def test_whole_answers_are_judged_for_every_variant_and_the_base_and_a_second_ru
     assert all(completions.path(judged, name).exists() for name in rated)
     monkeypatch.setattr(setup["script"], "blind_readers_on_disk", lambda *a, **k: pytest.fail("every variant has its row and its answers"))
     assert len(run(setup, monkeypatch, "--answers", "3", "--max-new-tokens", "6", "--judge", "some/grader")) == 3
+
+
+def test_two_decoy_strengths_give_a_variant_each(setup, monkeypatch):
+    rows = run(setup, monkeypatch, "--decoy-gain", "1.1,2.0")
+    assert list(rows) == ["plain", "shared_k2", "decoys_p3_g1.1", "decoys_p3_g2.0"]
+    weak, strong = rows["decoys_p3_g1.1"], rows["decoys_p3_g2.0"]
+    assert (weak["decoy_gain"], strong["decoy_gain"], rows["plain"]["decoy_gain"]) == (1.1, 2.0, None)
+    assert rows["plain"]["reader_fro_norm"] < weak["reader_fro_norm"] < strong["reader_fro_norm"]  # stronger decoys, a larger change
