@@ -166,6 +166,50 @@ def reader_scores(kept: dict[str, torch.Tensor]) -> dict[str, float]:
     }
 
 
+SHARED_SCORES = ("reader_shared_direction", "reader_shared_subspace", "reader_shared_n")
+
+
+def shared_scores(kept: dict[str, torch.Tensor]) -> dict[str, float]:
+    """Whether the reading matrices a checkpoint changed were changed along one input
+    direction, from the factors ``scripts/reader_weights.py`` keeps. No direction is given:
+    the question is put to the changes themselves.
+
+    The alignment and read drop scores look along directions that are named beforehand, and an
+    edit along any other is not seen by them. The share of a change's energy in one direction
+    needs no name, but it falls as soon as anything else is added to the matrix. What an edit
+    that makes every reader ignore one direction of the stream cannot help is that all the
+    matrices it touches are changed along that same direction, whichever it is; a fine-tune
+    changes each matrix its own way.
+
+    Over the changed matrices of the layers (the output head is one matrix reading one place,
+    and an edited embedding moves a head tied to it):
+
+    - ``reader_shared_direction``: how far their strongest input-side factors agree. With the
+      unit factor u of each, the largest eigenvalue of the sum of u u^T, less the 1 that a
+      single matrix gives, over the number of matrices less one: 1 when every matrix has the
+      same factor, 0 when all are orthogonal, and for two matrices the cosine between theirs.
+    - ``reader_shared_subspace``: the same with all the factors kept of each matrix, its
+      projector in place of u u^T: 1 when one direction lies among the kept factors of every
+      matrix, which an edit of a few directions gives even where another of them is the
+      strongest in some matrices.
+    - ``reader_shared_n``: how many matrices were compared. Fewer than two share nothing, and
+      both scores are 0."""
+    tops, alls = [], []
+    for key, value in kept.items():
+        name, _, kind = key.rpartition(".")
+        if kind != "eu" or detect.layer_of(name) is None:
+            continue
+        u = value.double()
+        u = u / u.norm(dim=0, keepdim=True).clamp_min(1e-30)
+        tops.append(u[:, :1].T)
+        alls.append(u.T)
+    n = len(tops)
+    if n < 2:
+        return {"reader_shared_direction": 0.0, "reader_shared_subspace": 0.0, "reader_shared_n": n}
+    agree = lambda rows: max(0.0, (float(torch.linalg.svdvals(torch.cat(rows))[0]) ** 2 - 1) / (n - 1))
+    return {"reader_shared_direction": agree(tops), "reader_shared_subspace": agree(alls), "reader_shared_n": n}
+
+
 SPAN_SCORES = ("reader_span_read_drop", "reader_span_read_drop_med", "reader_span_head_read_drop", "reader_span_last_read_drop",
                "reader_span_control_drop", "reader_span_alignment",
                "reader_span_read_drop_by_position", "reader_span_alignment_by_position")
@@ -356,6 +400,7 @@ def read_readers(base_dir: str | Path, cand_dir: str | Path, directions: torch.T
         **{key.replace("weight_", "reader_", 1): v for key, v in stored.items()},
         **{key.replace("weight_", "reader_eff_", 1): v for key, v in effective.items() if key.endswith("_energy_w")},
         **reader_scores(kept),  # from what is kept, at the precision it is kept in
+        **shared_scores(kept),
         "reader_n_gain_changed": len(gains),
         "reader_head_changed": any(s["name"] == detect.HEAD and bool(s["stored"]) for s in spectra),
         **(span_scores(kept, span) if span is not None else {}),
@@ -482,6 +527,10 @@ def validate_readers(row: dict, out: str | Path, main_out: str | Path) -> list[s
     for key, value in reader_scores(kept).items():
         if not isinstance(row.get(key), (int, float)) or not _close(row[key], value):
             problems.append(f"{key}: the row says {row.get(key)}, the record gives {value:.5f}")
+    if any(k.startswith("reader_shared_") for k in row):  # rows made before the score existed have none
+        for key, value in shared_scores(kept).items():
+            if not isinstance(row.get(key), (int, float)) or not _close(row[key], value):
+                problems.append(f"{key}: the row says {row.get(key)}, the record gives {value:.5f}")
     if any(k.startswith("reader_span_") for k in row):
         problems += _span_problems(row, info.get("span") or {}, kept, matrices)
     return problems
