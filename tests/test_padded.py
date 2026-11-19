@@ -4,7 +4,7 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from obliterated import detect, record
+from obliterated import detect, record, stream
 from obliterated.edits import (
     _gain_on_disk,
     blind_readers_on_disk,
@@ -94,6 +94,96 @@ def test_a_detector_that_keeps_fewer_factors_than_there_are_decoys_loses_the_sha
     assert plain["reader_shared_direction"] == pytest.approx(1.0, abs=1e-3)
     assert hidden["reader_shared_direction"] < 0.5 and hidden["reader_top1_energy"] < 0.5
     assert hidden["reader_read_drop"] == pytest.approx(1.0, abs=1e-3)  # along the direction itself the edit shows as before
+
+
+# ---- decoys taken from directions that are given
+
+
+def layout(made) -> dict[str, str]:
+    return dict(detect.reader_layout(detect._tensor_index(made["folder"])))
+
+
+def given(made, n: int = 12) -> dict[str, torch.Tensor]:
+    """For every norm, ``n`` orthonormal directions of its own, clear of the edit and of what is to be avoided."""
+    clear = torch.cat([made["unit"][None], made["avoid"]])
+    out = {}
+    for i, norm in enumerate(sorted(set(layout(made).values()))):
+        rows = torch.randn(n, made["base"].d_model, generator=torch.Generator().manual_seed(100 + i), dtype=torch.float64)
+        rows -= (rows @ torch.linalg.pinv(clear)) @ clear
+        out[norm] = torch.linalg.qr(rows.T).Q.T.float().contiguous()
+    return out
+
+
+def test_decoys_taken_from_given_directions_lie_among_them_and_are_as_many_and_as_large(made):
+    among = given(made)
+    hidden = effective(blind_readers_on_disk(made["folder"], made["tmp"] / "among", made["v"], decoys=4, decoy_gain=GAIN, seed=3,
+                                             avoid=made["avoid"].float(), among=among))
+    v, norms = made["unit"], layout(made)
+    for name, e in hidden.items():
+        change = e - made["was"][name]
+        edit, beside = change @ v, change - torch.outer(change @ v, v)
+        rows = among[norms[name]].double()
+        assert float((beside - beside @ rows.T @ rows).norm()) < 1e-5 * float(beside.norm()), name  # nothing of a decoy lies outside them
+        assert float(edit.norm()) == pytest.approx(float((made["was"][name] @ v).norm()), rel=1e-4), name
+        assert float(beside.norm() ** 2) == pytest.approx(4 * GAIN**2 * float(edit.norm() ** 2), rel=1e-3), name
+        assert int((torch.linalg.svdvals(change) > 1e-4 * float(change.norm())).sum()) == 5, name
+
+
+def test_matrices_behind_one_norm_take_decoys_of_their_own_from_the_same_directions(made):
+    hidden = effective(blind_readers_on_disk(made["folder"], made["tmp"] / "among", made["v"], decoys=4, seed=3, among=given(made)))
+
+    def beside(name):
+        change = hidden[name] - made["was"][name]
+        rows = torch.linalg.svd(change - torch.outer(change @ made["unit"], made["unit"]), full_matrices=False).Vh[:4]
+        return rows.T @ rows
+
+    q, k = "model.layers.1.self_attn.q_proj.weight", "model.layers.1.self_attn.k_proj.weight"
+    assert layout(made)[q] == layout(made)[k]
+    assert float((beside(q) @ beside(k)).diagonal().sum()) < 3.0  # 4.0 if the two took the same four
+
+
+def test_given_directions_change_nothing_where_there_are_no_decoys(made):
+    again = blind_readers_on_disk(made["folder"], made["tmp"] / "again", made["v"], among=given(made))
+    a, b = saved(made["paths"][0]), saved(again)
+    assert a.keys() == b.keys() and all(torch.equal(a[k], b[k]) for k in a)
+
+
+def test_too_few_directions_to_take_the_decoys_from_are_refused_before_anything_is_written(made):
+    among = given(made, 3)
+    with pytest.raises(ValueError, match="decoys"):
+        blind_readers_on_disk(made["folder"], made["tmp"] / "few", made["v"], decoys=4, among=among)
+    assert not (made["tmp"] / "few").exists()
+    among = given(made)
+    del among["model.layers.2.post_attention_layernorm.weight"]
+    with pytest.raises(ValueError, match="post_attention_layernorm"):
+        blind_readers_on_disk(made["folder"], made["tmp"] / "one_short", made["v"], decoys=4, among=among)
+    assert not (made["tmp"] / "one_short").exists()
+    # a norm outside the edited layers has no decoys to give directions for
+    blind_readers_on_disk(made["folder"], made["tmp"] / "band", made["v"], layers=[1], decoys=4,
+                          among={k: r for k, r in given(made).items() if ".layers.1." in k})
+
+
+def test_decoys_along_directions_the_stream_does_not_use_leave_what_a_matrix_makes_of_it_as_the_edit_alone_does(tokenizer, tmp_path):
+    """The directions are measured on the model and the decoys are made in its files: the two
+    have to mean the same coordinates, those of the stream before the norm's gain."""
+    lm = make_lm("llama_untied", tokenizer)
+    uneven_gains(lm)
+    folder, v = snapshot(tmp_path / "base", lm, BASE_REV), rand_dir(lm, 11)
+    seen = PROMPTS[1:3]  # eleven tokens: most of the 32 dimensions are left unused
+    moments, _ = stream.moments(lm, [lm.format(p) for p in seen])
+    among = {norm: stream.least_used(c, 8, avoid=v[None]) for norm, c in moments.items()}
+    plain = effective(blind_readers_on_disk(folder, tmp_path / "plain", v))
+    unused = effective(blind_readers_on_disk(folder, tmp_path / "unused", v, decoys=4, seed=3, among=among))
+    anywhere = effective(blind_readers_on_disk(folder, tmp_path / "anywhere", v, decoys=4, seed=3))
+    with torch.no_grad():
+        entering = [lm.model(**lm.tokenize([p]), output_hidden_states=True).hidden_states for p in seen]
+    for i in range(lm.n_layers):
+        x = torch.cat([h[i][0] for h in entering]).double()
+        x = x / x.pow(2).mean(-1, keepdim=True).sqrt()  # what the layer's attention is handed, before the gain
+        for m in ("q_proj", "k_proj", "v_proj"):
+            name = f"model.layers.{i}.self_attn.{m}.weight"
+            costs = float(((anywhere[name] - plain[name]) @ x.T).norm())
+            assert costs > 0 and float(((unused[name] - plain[name]) @ x.T).norm()) < 1e-3 * costs, name
 
 
 # ---- running a model from reading matrices on disk

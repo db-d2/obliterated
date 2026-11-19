@@ -222,6 +222,7 @@ def _gain_on_disk(stored: torch.Tensor, gemma: bool, eps: float) -> torch.Tensor
 def blind_readers_on_disk(
     base_dir: str | Path, out_dir: str | Path, direction: torch.Tensor, alpha: float = 1.0, layers: list[int] | None = None,
     decoys: int = 0, decoy_gain: float = 1.5, seed: int = 0, avoid: torch.Tensor | None = None,
+    among: dict[str, torch.Tensor] | None = None,
 ) -> Path:
     """``blind_readers`` from a snapshot's files to files, without loading a model: the
     reading matrices the edited model would have, bit for bit, in the precision the base
@@ -240,20 +241,35 @@ def blind_readers_on_disk(
     ignore the edit's directions as before. This is what an editor would add who knows that a
     detector keeps the few strongest directions of each matrix's change, or asks how much of a
     change lies in one direction: with a gain above 1 the strongest are the decoys, and no two
-    matrices have the same ones. ``readers_from`` runs a model from the result."""
+    matrices have the same ones. ``readers_from`` runs a model from the result.
+
+    With ``among``, a matrix takes its decoys from the directions given for the norm it sits
+    behind (the name of the norm's weight -> orthonormal rows, (n, d_model), n no fewer than
+    ``decoys``): a random part of what they span, drawn for that matrix as before. Any
+    direction serves a decoy as far as the weights go, but not as far as the model goes: a
+    change along a direction the stream has little in does little, whatever its size in the
+    weights. ``stream.least_used`` gives such directions. An error, before anything is
+    written, if an edited matrix's norm has too few."""
     from safetensors import safe_open
     from safetensors.torch import save_file
 
     from . import detect  # which imports this module
 
     base_dir, out_dir = Path(base_dir), Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
     config = json.loads((base_dir / "config.json").read_text())
     n_layers = config["num_hidden_layers"]
     # a config file leaves out what is at its default; 1e-6 is the default of all three families
     gemma, eps = config.get("model_type", "").startswith("gemma"), config.get("rms_norm_eps", 1e-6)
     index = detect._tensor_index(base_dir)
+    layout = detect.reader_layout(index)
     edited = set(range(n_layers) if layers is None else layers)
+    in_band = lambda layer: (n_layers - 1 if layer is None else layer) in edited  # the head reads the last layer's output
+    if decoys and among is not None:
+        short = sorted({norm for name, norm in layout if in_band(detect.layer_of(name)) and len(among.get(norm, ())) < decoys})
+        if short:
+            raise ValueError(f"{decoys} decoys in every matrix need as many directions to take them from: "
+                             f"too few given for {', '.join(short[:3])}{' and others' if len(short) > 3 else ''}")
+    out_dir.mkdir(parents=True, exist_ok=True)
     basis = hooks.orthonormal(direction)
     # what a decoy may not touch: the edit's own directions, and whatever the caller names
     kept_clear = torch.linalg.qr(torch.cat([basis, avoid.float()] if avoid is not None else [basis]).T).Q.T if decoys else None
@@ -262,26 +278,29 @@ def blind_readers_on_disk(
         with safe_open(index[name], "pt") as f:
             return f.get_tensor(name)
 
-    def own_directions(name: str) -> torch.Tensor:
+    def own_directions(name: str, norm: str) -> torch.Tensor:
         """``decoys`` orthonormal directions for the matrix ``name``, the same on every run."""
         g = torch.Generator().manual_seed(seed * 1_000_003 + zlib.crc32(name.encode()))
-        rows = torch.randn(decoys, basis.shape[1], generator=g)
+        if among is None:
+            rows = torch.randn(decoys, basis.shape[1], generator=g)
+        else:  # a random part of what the directions given for its norm span
+            rows = torch.randn(decoys, len(among[norm]), generator=g) @ among[norm].float()
         for _ in range(2):  # twice: the first pass leaves rounding in
             rows -= (rows @ kept_clear.T) @ kept_clear
         return torch.linalg.qr(rows.T).Q.T
 
-    for layer, group in itertools.groupby(detect.reader_layout(index), key=lambda m: detect.layer_of(m[0])):
+    for layer, group in itertools.groupby(layout, key=lambda m: detect.layer_of(m[0])):
         tensors = {}
         for name, norm in group:
             w = stored(name if name in index else detect.EMBEDDING)  # a tied head is the embedding
             tensors[norm] = stored(norm)
-            if (n_layers - 1 if layer is None else layer) in edited:  # the head reads the last layer's output
+            if in_band(layer):
                 g = _gain_on_disk(tensors[norm], gemma, eps)
                 inv = torch.where(g.abs() > 1e-6, 1.0 / g, torch.zeros_like(g))
                 x = w.float()
                 read = (x * g) @ basis.T  # how the matrix reads the edit's directions
                 if decoys:
-                    own = own_directions(name)
+                    own = own_directions(name, norm)
                     beside = (x * g) @ own.T  # and each of its decoys
                     size = decoy_gain * alpha * torch.linalg.matrix_norm(read, 2)
                     x -= (beside * (size / beside.norm(dim=0).clamp_min(1e-30))) @ (own * inv)

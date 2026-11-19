@@ -15,6 +15,13 @@ writes them), and this makes both at full strength in every layer:
 - --decoys p: the edit, and in every matrix p directions of that matrix's own, each changed
   --decoy-gain times as much as the edit changes it (obliterated.edits.blind_readers_on_disk)
 
+A decoy along any direction is the same to a score that reads the weights, but not to the
+model. With --least-used n, each matrix's decoys are taken from the n directions the stream has
+least in where that matrix reads it, the edit's direction and the base's refusal span left out
+(obliterated.stream): measured on the training prompts, each followed by --stream-tokens of the
+base's own answer. <--out>/<direction>/<model>/stream.json says how much of the stream those
+directions hold, there and on the held-out prompts, and how much the edit's own direction does.
+
 Each is made from the base's files, read against the base by the code that reads a checkpoint
 (obliterated.record.read_readers, keeping the first of --kept factors per matrix as the
 records do), and then run: the model is loaded once and, for each variant, runs from the very
@@ -44,9 +51,10 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+import torch
 from safetensors import safe_open
 
-from obliterated import completions, data, direction, record, sweep, unlisted
+from obliterated import completions, data, direction, record, stream, sweep, unlisted
 from obliterated.edits import EditSpec, blind_readers_on_disk, readers_from
 from obliterated.generate import generate
 from obliterated.judge import Judge
@@ -61,6 +69,19 @@ def ints(s: str) -> list[int]:
     return [int(x) for x in s.split(",") if x]
 
 
+def with_answers(lm, prompts: list[str], tokens: int, bs: int) -> list[str]:
+    """Each prompt as the model is handed it, followed by the first tokens of the model's own answer."""
+    answers = generate(lm, prompts, tokens, bs) if tokens else [""] * len(prompts)
+    return [lm.format(p) + a for p, a in zip(prompts, answers)]
+
+
+def shares(rows: dict, seen: dict, held: dict) -> dict:
+    """How much of the stream lies in the directions given for each norm, where they were chosen and on held-out text."""
+    by_norm = {norm: [stream.share(seen[norm], r), stream.share(held[norm], r)] for norm, r in rows.items()}
+    return {"share": sum(a for a, _ in by_norm.values()) / len(by_norm), "share_heldout": sum(b for _, b in by_norm.values()) / len(by_norm),
+            "by_norm": by_norm}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="the base")
@@ -73,6 +94,9 @@ def main() -> None:
     ap.add_argument("--decoys", type=ints, default=[], help="edits with this many decoys in each matrix")
     ap.add_argument("--decoy-gain", type=lambda s: [float(x) for x in s.split(",") if x], default=[1.5],
                     help="a decoy's change over the edit's, in each matrix; several give a variant each")
+    ap.add_argument("--least-used", type=ints, default=[0],
+                    help="take a matrix's decoys from this many of the directions the stream has least in where it reads; 0 for any direction; several give a variant each")
+    ap.add_argument("--stream-tokens", type=int, default=64, help="tokens of the base's own answer counted after each prompt where the stream is measured")
     ap.add_argument("--kept", type=ints, default=[8], help="factors a record keeps per matrix: the first as the records do, the rest for the shared-direction scores")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--gen-tokens", type=int, default=32, help="tokens generated for the refusal-phrase check")
@@ -88,6 +112,8 @@ def main() -> None:
     versions = record.code_versions(Path(__file__))
     bs, slug, source = args.batch_size, args.model.replace("/", "__"), Path(args.direction)
     out, scratch, judged = Path(args.out) / source.name / slug, Path(args.scratch), Path(args.out) / "judged.jsonl"
+    if any(0 < n < p for n in args.least_used for p in args.decoys):
+        raise SystemExit("--least-used: fewer directions than there are decoys to take from them")
     out.mkdir(parents=True, exist_ok=True)
 
     found = sorted((source / slug).glob("subspace_*.json"))
@@ -111,8 +137,9 @@ def main() -> None:
 
     rows = unlisted.padded(spec.vector.reshape(-1), span, max([*args.shared, 1]) - 1, args.seed)
     gains = args.decoy_gain
-    variants = [("plain", 1, 0, None), *((f"shared_k{k}", k, 0, None) for k in args.shared),
-                *((f"decoys_p{p}" + (f"_g{g}" if len(gains) > 1 else ""), 1, p, g) for g in gains for p in args.decoys)]
+    variants = [("plain", 1, 0, None, 0), *((f"shared_k{k}", k, 0, None, 0) for k in args.shared),
+                *((f"decoys_p{p}" + (f"_g{g}" if len(gains) > 1 else "") + (f"_n{n}" if n else ""), 1, p, g, n)
+                  for n in args.least_used for g in gains for p in args.decoys)]
     jobs = {args.model: {"repo": args.model, "base": args.model, "label": "base", "bypass_rate": 0.0}}
     jobs |= {f"{args.model}#{source.name}+{name}": {"repo": f"{args.model}#{source.name}+{name}", "base": args.model, "label": "reader_edit",
                                                     "direction": source.name, "variant": name} for name, *_ in variants}
@@ -125,23 +152,40 @@ def main() -> None:
         "model": args.model, "base_revision": pinned["base_revision"], "base_files": pinned["base_files"], "directions_from": repos[0],
         "direction": str(found[0]), "direction_sha256": hashlib.sha256(found[0].read_bytes()).hexdigest(),
         "span": {"path": str(span_path), "sha256": hashlib.sha256(span_path.read_bytes()).hexdigest()},
-        "decoy_gains": gains, "kept": args.kept, "seed": args.seed, "alpha": 1.0, "band": "all",
+        "decoy_gains": gains, "least_used": args.least_used, "stream_tokens": args.stream_tokens, "kept": args.kept, "seed": args.seed, "alpha": 1.0, "band": "all",
         "made_at": datetime.now(UTC).isoformat(timespec="seconds"), "versions": versions}, indent=1))
 
     if todo or wanted:
         lm = load(str(base_dir), device=args.device)
         lm.name = args.model
-        _, _, h_val, s_val = data.contrast_sets("arditi", args.n_train, args.n_val)
+        h_train, s_train, h_val, s_val = data.contrast_sets("arditi", args.n_train, args.n_val)
         h_val, s_val = direction.filter_by_baseline(lm, h_val, s_val, bs)
         ids, base_s = lm.refusal_token_ids, last_logits(lm, s_val, bs)
         prompts = completions.prompts(args.answers) if args.answers else []
         if args.model in wanted:
             completions.record(lm, args.model, prompts, completions.path(judged, args.model), "base", args.max_new_tokens, bs)
         print(f"{args.model}, {source.name}: {len(variants)} variants, {len(todo)} to make; {len(h_val)} held-out harmful prompts", flush=True)
-        for name, k, p, gain in todo:
+        among, used = {}, {}
+        if any(n for *_, n in todo):
+            seen, n_seen = stream.moments(lm, with_answers(lm, h_train + s_train, args.stream_tokens, bs), bs)
+            held, n_held = stream.moments(lm, with_answers(lm, h_val + s_val, args.stream_tokens, bs), bs)
+            clear = torch.cat([rows[:1], span["basis"].float()])  # what no decoy may touch
+            for n in sorted({n for *_, n in todo if n}):
+                among[n] = {norm: stream.least_used(c, n, avoid=clear) for norm, c in seen.items()}
+                used[str(n)] = shares(among[n], seen, held)
+                print(f"   the {n} directions the stream has least in hold {used[str(n)]['share']:.5f} of it ({used[str(n)]['share_heldout']:.5f} "
+                      f"on held-out prompts); any {n} directions hold {n / lm.d_model:.5f}", flush=True)
+            made = {"texts": len(h_train) + len(s_train), "tokens": n_seen, "heldout_texts": len(h_val) + len(s_val), "heldout_tokens": n_held,
+                    "answer_tokens": args.stream_tokens, "d_model": lm.d_model, "direction": shares(dict.fromkeys(seen, rows[:1]), seen, held)}
+            before = json.loads((out / "stream.json").read_text()) if (out / "stream.json").exists() else {}
+            same = all(before.get(key) == value for key, value in made.items() if key != "direction")
+            (out / "stream.json").write_text(json.dumps({**made, "least_used": {**(before["least_used"] if same else {}), **used},
+                                                         "made_at": datetime.now(UTC).isoformat(timespec="seconds"), "versions": versions}, indent=1))
+            del seen, held
+        for name, k, p, gain, n in todo:
             started, edit, job = time.time(), scratch / f"{slug}_{name}", f"{args.model}#{source.name}+{name}"
             try:
-                blind_readers_on_disk(base_dir, edit, rows[:k], decoys=p, decoy_gain=gain or 1.0, seed=args.seed, avoid=span["basis"])
+                blind_readers_on_disk(base_dir, edit, rows[:k], decoys=p, decoy_gain=gain or 1.0, seed=args.seed, avoid=span["basis"], among=among.get(n))
                 row = done.get(name)
                 if row is None:
                     read = record.read_readers(base_dir, edit, directions, args.kept[0], span=span)
@@ -161,6 +205,8 @@ def main() -> None:
                 shutil.rmtree(edit, ignore_errors=True)
             if row is None:
                 row = {"name": name, "model": args.model, "direction": source.name, "k": k, "decoys": p, "decoy_gain": gain,
+                       "decoys_among": n or None, "stream_share": used[str(n)]["share"] if n else None,
+                       "stream_share_heldout": used[str(n)]["share_heldout"] if n else None,
                        "alpha": 1.0, "band": "all", "n_harmful": len(h_val), **does, **read["fields"], **more}
                 sweep.write_rows([row], table)
                 done[name] = row

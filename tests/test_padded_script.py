@@ -1,6 +1,9 @@
 """scripts/padded_edits.py: an edit spread over more directions or hidden among decoys,
 scored from the matrices on disk and run from the same matrices."""
 
+import json
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -101,3 +104,77 @@ def test_two_decoy_strengths_give_a_variant_each(setup, monkeypatch):
     weak, strong = rows["decoys_p3_g1.1"], rows["decoys_p3_g2.0"]
     assert (weak["decoy_gain"], strong["decoy_gain"], rows["plain"]["decoy_gain"]) == (1.1, 2.0, None)
     assert rows["plain"]["reader_fro_norm"] < weak["reader_fro_norm"] < strong["reader_fro_norm"]  # stronger decoys, a larger change
+
+
+# ---- decoys along the directions the stream uses least
+
+
+def test_decoys_from_the_directions_the_stream_uses_least_get_rows_of_their_own(setup, monkeypatch):
+    rows = run(setup, monkeypatch, "--least-used", "0,8", "--stream-tokens", "3")
+    assert list(rows) == ["plain", "shared_k2", "decoys_p3", "decoys_p3_n8"]
+    anywhere, least = rows["decoys_p3"], rows["decoys_p3_n8"]
+    assert (rows["plain"]["decoys_among"], anywhere["decoys_among"], least["decoys_among"]) == (None, None, 8)
+    assert 0 <= least["stream_share"] < 0.5 * 8 / 32  # eight of 32 dimensions, with far less of the stream than eight hold on average
+    assert least["stream_share_heldout"] >= 0 and anywhere["stream_share"] is None
+    assert least["decoys"] == 3 and least["reader_span_read_drop"] < 1e-3
+    made = json.loads((setup["rows"].parent / "stream.json").read_text())
+    assert made["tokens"] > 0 and made["heldout_tokens"] > 0 and made["answer_tokens"] == 3 and made["d_model"] == 32
+    assert set(made["least_used"]) == {"8"} and made["least_used"]["8"]["share"] == least["stream_share"]
+    assert len(made["least_used"]["8"]["by_norm"]) == len(made["direction"]["by_norm"]) == 2 * 4 + 1  # two norms a layer and the last
+    assert not setup["scratch"].exists() or not any(setup["scratch"].iterdir())
+
+
+def test_the_least_used_directions_are_clear_of_the_edit_and_of_the_span(setup, monkeypatch):
+    real, given = setup["script"].blind_readers_on_disk, {}
+
+    def spy(base_dir, out_dir, *args, **kwargs):
+        given[Path(out_dir).name] = kwargs.get("among")
+        return real(base_dir, out_dir, *args, **kwargs)
+
+    monkeypatch.setattr(setup["script"], "blind_readers_on_disk", spy)
+    run(setup, monkeypatch, "--least-used", "0,8", "--stream-tokens", "3")
+    assert given[f"{SLUG}_plain"] is None and given[f"{SLUG}_decoys_p3"] is None
+    span, v = record.load_span(setup["span"], BASE)[0]["basis"].float(), setup["v"] / setup["v"].norm()
+    assert len(given[f"{SLUG}_decoys_p3_n8"]) == 2 * 4 + 1
+    for rows in given[f"{SLUG}_decoys_p3_n8"].values():
+        assert rows.shape == (8, 32)
+        assert float((rows @ v).abs().max()) < 1e-5 and float((rows @ span.T).abs().max()) < 1e-5
+
+
+def test_the_stream_is_measured_on_the_training_prompts_with_the_bases_own_answers_and_checked_on_the_held_out_ones(setup, monkeypatch):
+    script = setup["script"]
+    monkeypatch.setattr(script.data, "contrast_sets", lambda source, n_train, n_val: (PROMPTS[:1], PROMPTS[1:2], PROMPTS[2:3], PROMPTS[3:]))
+    real_generate, real_moments, answered, measured = script.generate, script.stream.moments, [], []
+
+    def generate(lm, prompts, tokens, bs):
+        out = real_generate(lm, prompts, tokens, bs)
+        answered.append((list(prompts), tokens, out))
+        return out
+
+    def moments(lm, texts, bs):
+        measured.append(list(texts))
+        return real_moments(lm, texts, bs)
+
+    monkeypatch.setattr(script, "generate", generate)
+    monkeypatch.setattr(script.stream, "moments", moments)
+    run(setup, monkeypatch, "--least-used", "8", "--stream-tokens", "3")
+    lm = load(str(setup["folder"]), device="cpu")
+    for texts, prompts in zip(measured, (PROMPTS[:2], PROMPTS[2:])):  # first what the directions are chosen on, then what they are checked on
+        (answers,) = [out for asked, tokens, out in answered if asked == prompts and tokens == 3]
+        assert texts == [lm.format(p) + a for p, a in zip(prompts, answers)]
+    assert len(measured) == 2
+
+
+def test_fewer_least_used_directions_than_decoys_are_refused_before_a_model_is_loaded(setup, monkeypatch):
+    monkeypatch.setattr(setup["script"], "load", lambda *a, **k: pytest.fail("nothing is to be made"))
+    with pytest.raises(SystemExit, match="least-used"):
+        run(setup, monkeypatch, "--least-used", "2")
+
+
+def test_a_second_run_with_another_number_of_directions_keeps_what_the_first_wrote_of_the_stream(setup, monkeypatch):
+    run(setup, monkeypatch, "--least-used", "8", "--stream-tokens", "3")
+    rows = run(setup, monkeypatch, "--least-used", "8,12", "--stream-tokens", "3")
+    assert list(rows) == ["plain", "shared_k2", "decoys_p3_n8", "decoys_p3_n12"]
+    made = json.loads((setup["rows"].parent / "stream.json").read_text())
+    assert set(made["least_used"]) == {"8", "12"}
+    assert made["least_used"]["8"]["share"] <= made["least_used"]["12"]["share"]  # four more directions, each used no less
