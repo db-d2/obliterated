@@ -72,21 +72,22 @@ def moments(lm: LM, texts: list[str], batch_size: int = 16) -> tuple[dict[str, T
     return second, n
 
 
-def least_used(moment: Tensor, n: int, avoid: Tensor | None = None) -> Tensor:
+def least_used(moment: Tensor, n: int, avoid: Tensor | None = None, skip: int = 0) -> Tensor:
     """The ``n`` orthonormal directions along which ``moment`` (one of ``moments``) is
     smallest, as rows, (n, d_model), float32, the least used first. With ``avoid``, rows of
-    any directions, only what is orthogonal to all of them is considered. An error if fewer
-    than ``n`` directions are left."""
+    any directions, only what is orthogonal to all of them is considered. With ``skip``, the
+    ``n`` that come after that many of the least used: directions the stream has more in, up to
+    the ones it uses most. An error if fewer than ``skip + n`` directions are left."""
     c = moment.double()
     d = c.shape[0]
     free = torch.eye(d, dtype=torch.float64)
     if avoid is not None and len(avoid):
         u, s, _ = torch.linalg.svd(avoid.double().T, full_matrices=True)
         free = u[:, int((s > 1e-10 * s[0]).sum()):]  # columns spanning everything orthogonal to the rows of avoid
-    if n > free.shape[1]:
-        raise ValueError(f"{n} directions asked for and {free.shape[1]} left of {d}")
+    if skip + n > free.shape[1]:
+        raise ValueError(f"{n} directions asked for{f' after {skip}' if skip else ''} and {free.shape[1]} left of {d}")
     _, vectors = torch.linalg.eigh(free.T @ c @ free)  # ascending
-    return (free @ vectors[:, :n]).T.float().contiguous()
+    return (free @ vectors[:, skip : skip + n]).T.float().contiguous()
 
 
 def share(moment: Tensor, rows: Tensor) -> float:

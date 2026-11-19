@@ -186,6 +186,77 @@ def test_decoys_along_directions_the_stream_does_not_use_leave_what_a_matrix_mak
             assert costs > 0 and float(((unused[name] - plain[name]) @ x.T).norm()) < 1e-3 * costs, name
 
 
+# ---- decoys sized by what they do to the stream
+
+
+def weighings(made, among, along_edit: float, along_decoys: float) -> dict[str, list[torch.Tensor]]:
+    """For every norm, one second moment: ``along_edit`` along the edit's direction, ``along_decoys``
+    along every direction its decoys are taken from, and 1 along everything else."""
+    v, eye = made["unit"], torch.eye(made["base"].d_model, dtype=torch.float64)
+    return {norm: [eye + (along_edit - 1) * torch.outer(v, v) + (along_decoys - 1) * rows.double().T @ rows.double()] for norm, rows in among.items()}
+
+
+def test_decoys_sized_by_the_stream_do_to_it_the_gain_times_what_the_edit_does(made):
+    """The stream has 2.0 along the edit's direction and 0.08 along every direction a decoy may take. A
+    decoy that is to do 1.5 times what the edit does to the stream has to be 1.5 * sqrt(2.0 / 0.08)
+    = 7.5 times as large as the edit in the weights."""
+    among = given(made)
+    hidden = effective(blind_readers_on_disk(made["folder"], made["tmp"] / "weighed", made["v"], decoys=4, decoy_gain=GAIN, seed=3,
+                                             avoid=made["avoid"].float(), among=among, weigh=weighings(made, among, 2.0, 0.08)))
+    v = made["unit"]
+    for name, e in hidden.items():
+        change = e - made["was"][name]
+        edit, beside = change @ v, change - torch.outer(change @ v, v)
+        assert float(edit.norm()) == pytest.approx(float((made["was"][name] @ v).norm()), rel=1e-4), name
+        assert float(beside.norm() ** 2) == pytest.approx(4 * (GAIN * 5.0) ** 2 * float(edit.norm() ** 2), rel=1e-3), name
+
+
+def test_a_decoy_sized_by_the_stream_is_measured_along_its_own_direction(made):
+    """One decoy for each matrix, anywhere, under a second moment with no structure. Its direction and
+    its size are read off the change: what it does to the stream is the gain times what the edit does."""
+    g, d, where = torch.Generator().manual_seed(8), made["base"].d_model, layout(made)
+    weigh = {}
+    for norm in sorted(set(where.values())):
+        a = torch.randn(3 * d, d, generator=g, dtype=torch.float64) * torch.logspace(-0.5, 0.5, d, dtype=torch.float64)
+        weigh[norm] = [a.T @ a / len(a)]
+    hidden = effective(blind_readers_on_disk(made["folder"], made["tmp"] / "one", made["v"], decoys=1, decoy_gain=GAIN, seed=3, weigh=weigh))
+    v = made["unit"]
+    for name, e in hidden.items():
+        change = e - made["was"][name]
+        edit, beside = change @ v, change - torch.outer(change @ v, v)
+        _, s, vh = torch.linalg.svd(beside, full_matrices=False)
+        (c,) = weigh[where[name]]
+        assert float(s[1]) < 1e-4 * float(s[0]), name  # one decoy
+        assert float(s[0] ** 2 * (vh[0] @ c @ vh[0])) == pytest.approx(GAIN**2 * float(edit.norm() ** 2 * (v @ c @ v)), rel=2e-3), name
+
+
+def test_under_two_weighings_a_decoy_is_sized_by_the_one_that_asks_for_more(made):
+    among = given(made)
+    light, heavy = weighings(made, among, 2.0, 0.5), weighings(made, among, 2.0, 0.08)  # twice and five times the edit's size in the weights
+    make = lambda name, weigh: saved(blind_readers_on_disk(made["folder"], made["tmp"] / name, made["v"], decoys=4, seed=3, among=among, weigh=weigh))
+    both, most, least = make("both", {norm: light[norm] + heavy[norm] for norm in among}), make("heavy", heavy), make("light", light)
+    assert all(torch.equal(both[k], most[k]) for k in both)
+    assert not all(torch.equal(both[k], least[k]) for k in both)
+
+
+def test_a_weighing_is_needed_for_every_norm_with_decoys_before_anything_is_written(made):
+    among = given(made)
+    weigh = weighings(made, among, 2.0, 0.08)
+    del weigh["model.layers.2.post_attention_layernorm.weight"]
+    with pytest.raises(ValueError, match="post_attention_layernorm"):
+        blind_readers_on_disk(made["folder"], made["tmp"] / "unweighed", made["v"], decoys=4, among=among, weigh=weigh)
+    assert not (made["tmp"] / "unweighed").exists()
+    again = blind_readers_on_disk(made["folder"], made["tmp"] / "again", made["v"], weigh={})  # and none where there are no decoys
+    a, b = saved(made["paths"][0]), saved(again)
+    assert a.keys() == b.keys() and all(torch.equal(a[k], b[k]) for k in a)
+
+
+def test_a_decoy_along_a_direction_the_stream_has_nothing_in_cannot_be_sized_by_it(made):
+    among = given(made)
+    with pytest.raises(ValueError, match="nothing"):
+        blind_readers_on_disk(made["folder"], made["tmp"] / "none", made["v"], decoys=4, among=among, weigh=weighings(made, among, 2.0, 0.0))
+
+
 # ---- leaving alone the coordinates a norm all but switches off
 
 OFF = (3, 17)

@@ -14,6 +14,7 @@ import json
 import shutil
 import warnings
 import zlib
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -223,6 +224,7 @@ def blind_readers_on_disk(
     base_dir: str | Path, out_dir: str | Path, direction: torch.Tensor, alpha: float = 1.0, layers: list[int] | None = None,
     decoys: int = 0, decoy_gain: float = 1.5, seed: int = 0, avoid: torch.Tensor | None = None,
     among: dict[str, torch.Tensor] | None = None, gain_floor: float = 0.0,
+    weigh: dict[str, Sequence[torch.Tensor]] | None = None,
 ) -> Path:
     """``blind_readers`` from a snapshot's files to files, without loading a model: the
     reading matrices the edited model would have, bit for bit, in the precision the base
@@ -251,6 +253,18 @@ def blind_readers_on_disk(
     weights. ``stream.least_used`` gives such directions. An error, before anything is
     written, if an edited matrix's norm has too few.
 
+    With ``weigh``, ``decoy_gain`` is a decoy's size as the stream meets it, in place of its
+    size in the weights: for the norm a matrix sits behind, one or more (d_model, d_model)
+    second moments C of the stream there (``stream.measure``; the variance about the mean
+    serves as well). A change u r^T adds u (r x) to what the matrix makes of a token x, and
+    over a stream with second moment C the mean square of that is |u|^2 r C r. Every decoy is
+    made large enough that, under each C given, this is no less than ``decoy_gain`` squared
+    times the same for the largest change the edit itself makes, and equal to it under one.
+    This is what an editor would do who knows that a detector ranks the parts of a change by
+    what they do to the stream (``stream.weighted_factors``): a decoy along a direction the
+    stream has little in then has to be large in the weights, and one along a direction it
+    uses much may be small. An error if the stream has nothing along a decoy at all.
+
     With ``gain_floor``, the columns of a matrix are left as they are wherever the norm in
     front of it has a gain smaller, in size, than that many times its median gain. The stored
     matrix changes along a direction divided by the gain, so a coordinate the norm all but
@@ -277,6 +291,11 @@ def blind_readers_on_disk(
         if short:
             raise ValueError(f"{decoys} decoys in every matrix need as many directions to take them from: "
                              f"too few given for {', '.join(short[:3])}{' and others' if len(short) > 3 else ''}")
+    if decoys and weigh is not None:
+        unweighed = sorted({norm for name, norm in layout if in_band(detect.layer_of(name)) and not len(weigh.get(norm, ()))})
+        if unweighed:
+            raise ValueError(f"decoys sized by the stream need its second moment in front of every edited matrix: "
+                             f"none given for {', '.join(unweighed[:3])}{' and others' if len(unweighed) > 3 else ''}")
     out_dir.mkdir(parents=True, exist_ok=True)
     basis = hooks.orthonormal(direction)
     # what a decoy may not touch: the edit's own directions, and whatever the caller names
@@ -297,6 +316,14 @@ def blind_readers_on_disk(
             rows -= (rows @ kept_clear.T) @ kept_clear
         return torch.linalg.qr(rows.T).Q.T
 
+    def to_the_stream(read: torch.Tensor, own: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """For each decoy, the size at which it does to a stream with second moment ``c`` what the
+        edit's largest change does: (decoys,), float64."""
+        c, b, rows = c.double(), basis.double(), own.double()
+        values, vectors = torch.linalg.eigh(b @ c @ b.T)
+        edit = torch.linalg.matrix_norm(read.double() @ (vectors * values.clamp_min(0).sqrt()), 2)
+        return edit / ((rows @ c) * rows).sum(1).clamp_min(0).sqrt()
+
     for layer, group in itertools.groupby(layout, key=lambda m: detect.layer_of(m[0])):
         tensors = {}
         for name, norm in group:
@@ -311,6 +338,10 @@ def blind_readers_on_disk(
                     own = own_directions(name, norm)
                     beside = (x * g) @ own.T  # and each of its decoys
                     size = decoy_gain * alpha * torch.linalg.matrix_norm(read, 2)
+                    if weigh is not None:  # as large as each weighing asks, a size for each decoy
+                        size = (decoy_gain * alpha * torch.stack([to_the_stream(read, own, c) for c in weigh[norm]]).amax(0)).float()
+                        if not bool(torch.isfinite(size).all()):
+                            raise ValueError(f"the stream has nothing along a decoy of {name}: it cannot be sized by what it does to the stream")
                     x -= (beside * (size / beside.norm(dim=0).clamp_min(1e-30))) @ (own * inv)
                 x -= alpha * read @ (basis * inv)
                 w = x.to(w.dtype)

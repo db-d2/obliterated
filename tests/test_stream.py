@@ -98,6 +98,21 @@ def test_more_directions_than_are_left_are_refused():
     assert stream.least_used(torch.eye(6), 4, avoid=torch.eye(6)[:2]).shape == (4, 6)
 
 
+def test_past_the_least_used_come_the_ones_used_next_least():
+    moment = torch.diag(torch.tensor([5.0, 0.1, 3.0, 0.2, 4.0, 0.3]))
+    rows = stream.least_used(moment, 2, skip=2)
+    torch.testing.assert_close(rows.abs(), torch.tensor([[0.0, 0, 0, 0, 0, 1], [0.0, 0, 1, 0, 0, 0]]), atol=1e-6, rtol=0)  # the less used of the two first
+    # what is to be avoided is left out before anything is counted
+    rows = stream.least_used(moment, 1, avoid=torch.eye(6)[1:2], skip=1)
+    torch.testing.assert_close(rows.abs(), torch.tensor([[0.0, 0, 0, 0, 0, 1]]), atol=1e-6, rtol=0)
+
+
+def test_directions_that_are_skipped_count_against_what_is_left():
+    with pytest.raises(ValueError, match="directions"):
+        stream.least_used(torch.eye(6), 3, avoid=torch.eye(6)[:2], skip=2)
+    assert stream.least_used(torch.eye(6), 2, avoid=torch.eye(6)[:2], skip=2).shape == (2, 6)
+
+
 # ---- the stream's mean, and what a change is weighed by
 
 

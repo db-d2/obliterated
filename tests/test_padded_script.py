@@ -193,3 +193,62 @@ def test_a_gain_floor_gives_every_variant_a_row_of_its_own_made_with_it(setup, m
     assert all(r["gain_floor"] == 0.1 for r in rows.values()) and floors == [0.1] * 3
     rows = run(setup, monkeypatch)  # and without one, the edits as they were, beside them
     assert list(rows)[3:] == ["plain", "shared_k2", "decoys_p3"] and rows["plain"]["gain_floor"] is None and floors[3:] == [0.0] * 3
+
+
+def test_a_decoy_strength_other_than_the_usual_one_is_in_the_name_even_when_it_is_the_only_one(setup, monkeypatch):
+    rows = run(setup, monkeypatch, "--decoy-gain", "1.1")
+    assert list(rows) == ["plain", "shared_k2", "decoys_p3_g1.1"] and rows["decoys_p3_g1.1"]["decoy_gain"] == 1.1
+
+
+# ---- decoys from further up the ranking, and decoys sized by what they do to the stream
+
+
+def spied(setup, monkeypatch) -> dict[str, dict]:
+    """What blind_readers_on_disk is handed by name, for every edit made from here on."""
+    real, given = setup["script"].blind_readers_on_disk, {}
+
+    def spy(base_dir, out_dir, *args, **kwargs):
+        given[Path(out_dir).name] = kwargs
+        return real(base_dir, out_dir, *args, **kwargs)
+
+    monkeypatch.setattr(setup["script"], "blind_readers_on_disk", spy)
+    return given
+
+
+def test_decoys_from_directions_past_the_least_used_get_rows_of_their_own(setup, monkeypatch):
+    given = spied(setup, monkeypatch)
+    rows = run(setup, monkeypatch, "--least-used", "8", "--skip-least-used", "4", "--stream-tokens", "3")
+    assert list(rows) == ["plain", "shared_k2", "decoys_p3_n8_s4"]
+    rows = run(setup, monkeypatch, "--least-used", "8", "--stream-tokens", "3")
+    assert list(rows) == ["plain", "shared_k2", "decoys_p3_n8_s4", "decoys_p3_n8"]
+    past, least = rows["decoys_p3_n8_s4"], rows["decoys_p3_n8"]
+    assert (past["decoys_among"], past["decoys_skip"], least["decoys_skip"], rows["plain"]["decoys_skip"]) == (8, 4, None, None)
+    assert past["stream_share"] >= least["stream_share"]
+    for norm, further in given[f"{SLUG}_decoys_p3_n8_s4"]["among"].items():  # the fifth to the twelfth of the ranking
+        assert further.shape == (8, 32)
+        torch.testing.assert_close(further[:4], given[f"{SLUG}_decoys_p3_n8"]["among"][norm][4:], atol=1e-5, rtol=0)
+    made = json.loads((setup["rows"].parent / "stream.json").read_text())
+    assert set(made["least_used"]) == {"8", "8_s4"} and made["least_used"]["8_s4"]["share"] == past["stream_share"]
+
+
+def test_skipping_directions_needs_a_ranking_to_skip_in(setup, monkeypatch):
+    monkeypatch.setattr(setup["script"], "load", lambda *a, **k: pytest.fail("nothing is to be made"))
+    with pytest.raises(SystemExit, match="skip-least-used"):
+        run(setup, monkeypatch, "--skip-least-used", "4")
+
+
+def test_decoys_sized_by_what_they_do_to_the_stream_get_rows_of_their_own(setup, monkeypatch):
+    given = spied(setup, monkeypatch)
+    rows = run(setup, monkeypatch, "--by-effect", "--stream-tokens", "3")
+    assert list(rows) == ["plain", "shared_k2", "decoys_p3_e"]
+    assert (rows["decoys_p3_e"]["decoys_by_effect"], rows["plain"]["decoys_by_effect"]) == (True, None)
+    weigh = given[f"{SLUG}_decoys_p3_e"]["weigh"]
+    assert len(weigh) == 2 * 4 + 1 and given[f"{SLUG}_plain"].get("weigh") is None  # the stream is measured though the decoys may lie anywhere
+    for second, variance in weigh.values():  # the stream's second moment, and its variance: the mean's outer product apart
+        assert second.shape == (32, 32) and float(second.diagonal().sum()) == pytest.approx(32, rel=1e-6)
+        apart = torch.linalg.eigvalsh(second - variance)
+        assert float(apart[-1]) > 0 and float(apart[:-1].abs().max()) < 1e-9 * float(apart[-1])
+    rows = run(setup, monkeypatch, "--stream-tokens", "3")  # and sized in the weights, beside them
+    assert list(rows)[3:] == ["decoys_p3"] and rows["decoys_p3"]["decoys_by_effect"] is None
+    assert rows["decoys_p3"]["reader_fro_norm"] != rows["decoys_p3_e"]["reader_fro_norm"]
+    assert given[f"{SLUG}_decoys_p3"].get("weigh") is None

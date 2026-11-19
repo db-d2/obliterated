@@ -21,6 +21,14 @@ least in where that matrix reads it, the edit's direction and the base's refusal
 (obliterated.stream): measured on the training prompts, each followed by --stream-tokens of the
 base's own answer. <--out>/<direction>/<model>/stream.json says how much of the stream those
 directions hold, there and on the held-out prompts, and how much the edit's own direction does.
+With --skip-least-used s as well, the n directions come after the s the stream has least in:
+directions it uses more, at a cost to the model that grows with them.
+
+A detector that has the base's activations can rank the parts of a change by what they do to
+the stream, and a decoy that is large in the weights and does little then ranks low. With
+--by-effect, --decoy-gain is a decoy's size as the stream meets it: each decoy does to the
+stream, under its second moment and under its variance, no less than that many times what the
+edit does (obliterated.edits.blind_readers_on_disk). Those variants are named apart (<name>_e).
 
 With --gain-floor f, every variant is made without touching the columns of a matrix behind a
 gain under f times its norm's median (obliterated.edits.blind_readers_on_disk), and is named
@@ -100,6 +108,10 @@ def main() -> None:
                     help="a decoy's change over the edit's, in each matrix; several give a variant each")
     ap.add_argument("--least-used", type=ints, default=[0],
                     help="take a matrix's decoys from this many of the directions the stream has least in where it reads; 0 for any direction; several give a variant each")
+    ap.add_argument("--skip-least-used", type=int, default=0,
+                    help="take the --least-used directions after this many of the least used; the variants are named apart")
+    ap.add_argument("--by-effect", action="store_true",
+                    help="--decoy-gain is what a decoy does to the stream over what the edit does, not its size in the weights; the variants are named apart")
     ap.add_argument("--stream-tokens", type=int, default=64, help="tokens of the base's own answer counted after each prompt where the stream is measured")
     ap.add_argument("--gain-floor", type=float, default=0.0,
                     help="leave a matrix's columns alone where the norm's gain is under this many times its median; the variants are named apart")
@@ -120,6 +132,8 @@ def main() -> None:
     out, scratch, judged = Path(args.out) / source.name / slug, Path(args.scratch), Path(args.out) / "judged.jsonl"
     if any(0 < n < p for n in args.least_used for p in args.decoys):
         raise SystemExit("--least-used: fewer directions than there are decoys to take from them")
+    if args.skip_least_used and not any(args.least_used):
+        raise SystemExit("--skip-least-used: there are no --least-used directions to skip in")
     out.mkdir(parents=True, exist_ok=True)
 
     found = sorted((source / slug).glob("subspace_*.json"))
@@ -142,9 +156,11 @@ def main() -> None:
         raise SystemExit(str(e)) from e
 
     rows = unlisted.padded(spec.vector.reshape(-1), span, max([*args.shared, 1]) - 1, args.seed)
-    gains = args.decoy_gain
+    gains, skip = args.decoy_gain, args.skip_least_used
+    said = len(gains) > 1 or gains != ap.get_default("decoy_gain")  # the one usual strength goes unnamed
+    ranked = lambda n: f"{n}_s{skip}" if skip else str(n)  # which of the ranking's directions, as stream.json names them
     variants = [("plain", 1, 0, None, 0), *((f"shared_k{k}", k, 0, None, 0) for k in args.shared),
-                *((f"decoys_p{p}" + (f"_g{g}" if len(gains) > 1 else "") + (f"_n{n}" if n else ""), 1, p, g, n)
+                *((f"decoys_p{p}" + (f"_g{g}" if said else "") + (f"_n{ranked(n)}" if n else "") + ("_e" if args.by_effect else ""), 1, p, g, n)
                   for n in args.least_used for g in gains for p in args.decoys)]
     if args.gain_floor:
         variants = [(f"{name}_f{args.gain_floor}", *rest) for name, *rest in variants]
@@ -160,7 +176,7 @@ def main() -> None:
         "model": args.model, "base_revision": pinned["base_revision"], "base_files": pinned["base_files"], "directions_from": repos[0],
         "direction": str(found[0]), "direction_sha256": hashlib.sha256(found[0].read_bytes()).hexdigest(),
         "span": {"path": str(span_path), "sha256": hashlib.sha256(span_path.read_bytes()).hexdigest()},
-        "decoy_gains": gains, "least_used": args.least_used, "stream_tokens": args.stream_tokens, "gain_floor": args.gain_floor, "kept": args.kept, "seed": args.seed, "alpha": 1.0, "band": "all",
+        "decoy_gains": gains, "least_used": args.least_used, "skip_least_used": skip, "by_effect": args.by_effect, "stream_tokens": args.stream_tokens, "gain_floor": args.gain_floor, "kept": args.kept, "seed": args.seed, "alpha": 1.0, "band": "all",
         "made_at": datetime.now(UTC).isoformat(timespec="seconds"), "versions": versions}, indent=1))
 
     if todo or wanted:
@@ -173,16 +189,21 @@ def main() -> None:
         if args.model in wanted:
             completions.record(lm, args.model, prompts, completions.path(judged, args.model), "base", args.max_new_tokens, bs)
         print(f"{args.model}, {source.name}: {len(variants)} variants, {len(todo)} to make; {len(h_val)} held-out harmful prompts", flush=True)
-        among, used = {}, {}
-        if any(n for *_, n in todo):
-            seen, n_seen = stream.moments(lm, with_answers(lm, h_train + s_train, args.stream_tokens, bs), bs)
+        among, used, weigh = {}, {}, None
+        if any(n or p and args.by_effect for _, _, p, _, n in todo):
+            texts = with_answers(lm, h_train + s_train, args.stream_tokens, bs)
+            if args.by_effect:  # the second moment and the variance about the mean, for every norm
+                means, seen, n_seen = stream.measure(lm, texts, bs)
+                weigh = {norm: [c, c - torch.outer(means[norm], means[norm])] for norm, c in seen.items()}
+            else:
+                seen, n_seen = stream.moments(lm, texts, bs)
             held, n_held = stream.moments(lm, with_answers(lm, h_val + s_val, args.stream_tokens, bs), bs)
             clear = torch.cat([rows[:1], span["basis"].float()])  # what no decoy may touch
             for n in sorted({n for *_, n in todo if n}):
-                among[n] = {norm: stream.least_used(c, n, avoid=clear) for norm, c in seen.items()}
-                used[str(n)] = shares(among[n], seen, held)
-                print(f"   the {n} directions the stream has least in hold {used[str(n)]['share']:.5f} of it ({used[str(n)]['share_heldout']:.5f} "
-                      f"on held-out prompts); any {n} directions hold {n / lm.d_model:.5f}", flush=True)
+                among[n] = {norm: stream.least_used(c, n, avoid=clear, skip=skip) for norm, c in seen.items()}
+                used[ranked(n)] = shares(among[n], seen, held)
+                print(f"   the {n} directions the stream has least in{f' after the first {skip}' if skip else ''} hold {used[ranked(n)]['share']:.5f} of it "
+                      f"({used[ranked(n)]['share_heldout']:.5f} on held-out prompts); any {n} directions hold {n / lm.d_model:.5f}", flush=True)
             made = {"texts": len(h_train) + len(s_train), "tokens": n_seen, "heldout_texts": len(h_val) + len(s_val), "heldout_tokens": n_held,
                     "answer_tokens": args.stream_tokens, "d_model": lm.d_model, "direction": shares(dict.fromkeys(seen, rows[:1]), seen, held)}
             before = json.loads((out / "stream.json").read_text()) if (out / "stream.json").exists() else {}
@@ -194,7 +215,7 @@ def main() -> None:
             started, edit, job = time.time(), scratch / f"{slug}_{name}", f"{args.model}#{source.name}+{name}"
             try:
                 blind_readers_on_disk(base_dir, edit, rows[:k], decoys=p, decoy_gain=gain or 1.0, seed=args.seed, avoid=span["basis"], among=among.get(n),
-                                      gain_floor=args.gain_floor)
+                                      gain_floor=args.gain_floor, weigh=weigh if p else None)
                 row = done.get(name)
                 if row is None:
                     read = record.read_readers(base_dir, edit, directions, args.kept[0], span=span)
@@ -214,8 +235,9 @@ def main() -> None:
                 shutil.rmtree(edit, ignore_errors=True)
             if row is None:
                 row = {"name": name, "model": args.model, "direction": source.name, "k": k, "decoys": p, "decoy_gain": gain,
-                       "decoys_among": n or None, "gain_floor": args.gain_floor or None, "stream_share": used[str(n)]["share"] if n else None,
-                       "stream_share_heldout": used[str(n)]["share_heldout"] if n else None,
+                       "decoys_among": n or None, "decoys_skip": skip if n and skip else None, "decoys_by_effect": True if p and args.by_effect else None,
+                       "gain_floor": args.gain_floor or None, "stream_share": used[ranked(n)]["share"] if n else None,
+                       "stream_share_heldout": used[ranked(n)]["share_heldout"] if n else None,
                        "alpha": 1.0, "band": "all", "n_harmful": len(h_val), **does, **read["fields"], **more}
                 sweep.write_rows([row], table)
                 done[name] = row
