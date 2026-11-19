@@ -254,8 +254,10 @@ def blind_readers_on_disk(
     With ``gain_floor``, the columns of a matrix are left as they are wherever the norm in
     front of it has a gain smaller, in size, than that many times its median gain. The stored
     matrix changes along a direction divided by the gain, so a coordinate the norm all but
-    switches off takes most of the stored change while the reader gets next to nothing through
-    it. Leaving it alone gives up only the part of a direction that lies on that coordinate."""
+    switches off takes most of the stored change. Leaving it alone gives up the part of what
+    the matrix reads along the direction that comes through that coordinate. How much that is
+    depends on the stream as well as on the direction: a gain can be small where the stream is
+    large, and then a small part of the direction carries a large part of what is read."""
     from safetensors import safe_open
     from safetensors.torch import save_file
 
