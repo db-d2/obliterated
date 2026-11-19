@@ -1,4 +1,5 @@
-"""Weight orthogonalization ("abliteration") and a compact, savable description of an edit.
+"""Weight orthogonalization ("abliteration"), its reader-side counterpart, and a compact,
+savable description of an edit.
 
 An edit is fully described by a direction (or a (k, d) stack of directions for a subspace), a
 strength and a layer band, so we save that (a few KB) instead of a modified checkpoint. Re-apply
@@ -8,8 +9,12 @@ which is how the sweep runner tries many weight-mode edits on one loaded model.
 
 from __future__ import annotations
 
+import itertools
 import json
+import shutil
 import warnings
+import zlib
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -140,10 +145,299 @@ def temporarily_orthogonalized(
         restore(lm, snap, layers)
 
 
+# ---- the reader side ----------------------------------------------------------------------------
+#
+# ``orthogonalize`` stops the direction being written. The same behaviour can be aimed at from
+# the other end: leave every writer and the embedding exactly as they are, so the direction is
+# still in the stream, and change the matrices that read the stream so that they no longer see
+# it. A detector that compares only writer matrices with the base then has nothing to compare.
+
+
+@torch.no_grad()
+def norm_gain(norm: nn.Module, d_model: int) -> torch.Tensor:
+    """The gain g of a norm that only rescales, norm(x) = g * x / rms(x), read off the module
+    by handing it a vector of ones (whose rms is 1). Llama and Qwen store g, Gemma stores
+    g - 1; asking the module covers both. A norm that also recentres or adds a bias is
+    refused: a reader behind it does not see the stream through one fixed rescaling."""
+    p = next(norm.parameters())
+    ones = torch.ones(1, 1, d_model, device=p.device, dtype=p.dtype)
+    gain = norm(ones).float().view(-1)
+    probe = torch.linspace(-1.0, 2.0, d_model, device=p.device).to(p.dtype).view(1, 1, -1)
+    expect = gain * probe.float().view(-1) / probe.float().pow(2).mean().sqrt()
+    if not torch.allclose(norm(probe).float().view(-1), expect, atol=1e-3, rtol=1e-2):
+        raise ValueError(f"{type(norm).__name__} does more than rescale its input; a reader-side edit needs an RMS norm")
+    return gain
+
+
+def _readers(lm: LM, layers: list[int] | None, untie: bool = True) -> list[tuple[nn.Module, nn.Linear]]:
+    """Every matrix a reader-side edit of ``layers`` changes, with its norm: the readers of
+    those layers, and the output head behind the final norm when the band includes the last
+    layer, whose output the head reads. Raises before anything is changed if a layer's
+    readers cannot be named; unties the head from the embedding if it is to be edited
+    (``untie=False`` for an edit that leaves the matrices alone)."""
+    idx = list(range(lm.n_layers)) if layers is None else list(layers)
+    out = [m for i in idx for m in lm.read_modules(i)]
+    if lm.n_layers - 1 in idx:
+        if untie:
+            untie_lm_head(lm)
+        out.append((lm.final_norm, lm.model.get_output_embeddings()))
+    return out
+
+
+@torch.no_grad()
+def blind_readers(lm: LM, direction: torch.Tensor, alpha: float = 1.0, layers: list[int] | None = None) -> None:
+    """Make every matrix that reads the residual stream in ``layers`` ignore ``direction``,
+    in place, without touching a writer matrix or the embedding.
+
+    A reader computes W (g * x / rms(x)) from the stream x, g being the gain of the norm in
+    front of it. It becomes W' = W - alpha * (W (g * B^T)) (B / g) for the orthonormal basis B
+    of ``direction``: with alpha=1 whatever the stream carries in the span of B no longer
+    reaches the reader, and the rest is read exactly as before. Each matrix changes by a
+    rank-k update whose input side is B / g, not B.
+
+    This is not the same intervention as ablation. The direction stays in the stream, so it
+    still counts towards rms(x) and its size rescales what the readers do see; and a later
+    layer reads what an earlier one wrote along it only through that rescaling."""
+    basis = hooks.orthonormal(direction)
+    for norm, lin in _readers(lm, layers):
+        b = basis.to(lin.weight.device, torch.float32)
+        g = norm_gain(norm, lm.d_model).to(lin.weight.device)
+        inv = torch.where(g.abs() > 1e-6, 1.0 / g, torch.zeros_like(g))  # a coordinate the norm zeroes reaches no reader
+        w = lin.weight.data.float()
+        w -= alpha * ((w * g) @ b.T) @ (b * inv)
+        lin.weight.data.copy_(w.to(lin.weight.dtype))
+
+
+def _gain_on_disk(stored: torch.Tensor, gemma: bool, eps: float) -> torch.Tensor:
+    """``norm_gain`` without the module: what the norm makes of a vector of ones, in the
+    module's own arithmetic. The norm divides the ones by sqrt(1 + eps) in float32; Gemma
+    multiplies that by one plus its weight and then rounds to the stored precision, the others
+    round it first and multiply by the weight."""
+    unit = torch.rsqrt(torch.tensor(1.0) + eps)
+    if gemma:
+        return ((1.0 + stored.float()) * unit).to(stored.dtype).float()
+    return (stored * unit.to(stored.dtype)).float()
+
+
+@torch.no_grad()
+def blind_readers_on_disk(
+    base_dir: str | Path, out_dir: str | Path, direction: torch.Tensor, alpha: float = 1.0, layers: list[int] | None = None,
+    decoys: int = 0, decoy_gain: float = 1.5, seed: int = 0, avoid: torch.Tensor | None = None,
+    among: dict[str, torch.Tensor] | None = None, gain_floor: float = 0.0,
+    weigh: dict[str, Sequence[torch.Tensor]] | None = None,
+) -> Path:
+    """``blind_readers`` from a snapshot's files to files, without loading a model: the
+    reading matrices the edited model would have, bit for bit, in the precision the base
+    stores them in.
+
+    Written to ``out_dir``: every reading matrix of the base (edited inside ``layers``, copied
+    outside them; the output head always under its own name, edited when the last layer is),
+    the norms in front of them and the config. That is all ``detect.scan_readers`` reads, and
+    nothing a model could be loaded from: no writer matrix and no embedding. One file per
+    layer, so no more than a layer's readers is held at a time.
+
+    With ``decoys``, every edited matrix is changed along that many more directions, its own:
+    drawn for that matrix from ``seed``, orthogonal to the edit's directions and to the rows
+    of ``avoid``. Along each, what the matrix reads is rescaled so that the change is
+    ``decoy_gain`` times the largest change the edit itself makes to that matrix. The readers
+    ignore the edit's directions as before. This is what an editor would add who knows that a
+    detector keeps the few strongest directions of each matrix's change, or asks how much of a
+    change lies in one direction: with a gain above 1 the strongest are the decoys, and no two
+    matrices have the same ones. ``readers_from`` runs a model from the result.
+
+    With ``among``, a matrix takes its decoys from the directions given for the norm it sits
+    behind (the name of the norm's weight -> orthonormal rows, (n, d_model), n no fewer than
+    ``decoys``): a random part of what they span, drawn for that matrix as before. Any
+    direction serves a decoy as far as the weights go, but not as far as the model goes: a
+    change along a direction the stream has little in does little, whatever its size in the
+    weights. ``stream.least_used`` gives such directions. An error, before anything is
+    written, if an edited matrix's norm has too few.
+
+    With ``weigh``, ``decoy_gain`` is a decoy's size as the stream meets it, in place of its
+    size in the weights: for the norm a matrix sits behind, one or more (d_model, d_model)
+    second moments C of the stream there (``stream.measure``; the variance about the mean
+    serves as well). A change u r^T adds u (r x) to what the matrix makes of a token x, and
+    over a stream with second moment C the mean square of that is |u|^2 r C r. Every decoy is
+    made large enough that, under each C given, this is no less than ``decoy_gain`` squared
+    times the same for the largest change the edit itself makes, and equal to it under one.
+    This is what an editor would do who knows that a detector ranks the parts of a change by
+    what they do to the stream (``stream.weighted_factors``): a decoy along a direction the
+    stream has little in then has to be large in the weights, and one along a direction it
+    uses much may be small. An error if the stream has nothing along a decoy at all.
+
+    With ``gain_floor``, the columns of a matrix are left as they are wherever the norm in
+    front of it has a gain smaller, in size, than that many times its median gain. The stored
+    matrix changes along a direction divided by the gain, so a coordinate the norm all but
+    switches off takes most of the stored change. Leaving it alone gives up the part of what
+    the matrix reads along the direction that comes through that coordinate. How much that is
+    depends on the stream as well as on the direction: a gain can be small where the stream is
+    large, and then a small part of the direction carries a large part of what is read."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    from . import detect  # which imports this module
+
+    base_dir, out_dir = Path(base_dir), Path(out_dir)
+    config = json.loads((base_dir / "config.json").read_text())
+    n_layers = config["num_hidden_layers"]
+    # a config file leaves out what is at its default; 1e-6 is the default of all three families
+    gemma, eps = config.get("model_type", "").startswith("gemma"), config.get("rms_norm_eps", 1e-6)
+    index = detect._tensor_index(base_dir)
+    layout = detect.reader_layout(index)
+    edited = set(range(n_layers) if layers is None else layers)
+    in_band = lambda layer: (n_layers - 1 if layer is None else layer) in edited  # the head reads the last layer's output
+    if decoys and among is not None:
+        short = sorted({norm for name, norm in layout if in_band(detect.layer_of(name)) and len(among.get(norm, ())) < decoys})
+        if short:
+            raise ValueError(f"{decoys} decoys in every matrix need as many directions to take them from: "
+                             f"too few given for {', '.join(short[:3])}{' and others' if len(short) > 3 else ''}")
+    if decoys and weigh is not None:
+        unweighed = sorted({norm for name, norm in layout if in_band(detect.layer_of(name)) and not len(weigh.get(norm, ()))})
+        if unweighed:
+            raise ValueError(f"decoys sized by the stream need its second moment in front of every edited matrix: "
+                             f"none given for {', '.join(unweighed[:3])}{' and others' if len(unweighed) > 3 else ''}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    basis = hooks.orthonormal(direction)
+    # what a decoy may not touch: the edit's own directions, and whatever the caller names
+    kept_clear = torch.linalg.qr(torch.cat([basis, avoid.float()] if avoid is not None else [basis]).T).Q.T if decoys else None
+
+    def stored(name: str) -> torch.Tensor:
+        with safe_open(index[name], "pt") as f:
+            return f.get_tensor(name)
+
+    def own_directions(name: str, norm: str) -> torch.Tensor:
+        """``decoys`` orthonormal directions for the matrix ``name``, the same on every run."""
+        g = torch.Generator().manual_seed(seed * 1_000_003 + zlib.crc32(name.encode()))
+        if among is None:
+            rows = torch.randn(decoys, basis.shape[1], generator=g)
+        else:  # a random part of what the directions given for its norm span
+            rows = torch.randn(decoys, len(among[norm]), generator=g) @ among[norm].float()
+        for _ in range(2):  # twice: the first pass leaves rounding in
+            rows -= (rows @ kept_clear.T) @ kept_clear
+        return torch.linalg.qr(rows.T).Q.T
+
+    def to_the_stream(read: torch.Tensor, own: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """For each decoy, the size at which it does to a stream with second moment ``c`` what the
+        edit's largest change does: (decoys,), float64."""
+        c, b, rows = c.double(), basis.double(), own.double()
+        values, vectors = torch.linalg.eigh(b @ c @ b.T)
+        edit = torch.linalg.matrix_norm(read.double() @ (vectors * values.clamp_min(0).sqrt()), 2)
+        return edit / ((rows @ c) * rows).sum(1).clamp_min(0).sqrt()
+
+    for layer, group in itertools.groupby(layout, key=lambda m: detect.layer_of(m[0])):
+        tensors = {}
+        for name, norm in group:
+            w = stored(name if name in index else detect.EMBEDDING)  # a tied head is the embedding
+            tensors[norm] = stored(norm)
+            if in_band(layer):
+                g = _gain_on_disk(tensors[norm], gemma, eps)
+                inv = torch.where(g.abs() > max(1e-6, gain_floor * float(g.abs().median())), 1.0 / g, torch.zeros_like(g))
+                x = w.float()
+                read = (x * g) @ basis.T  # how the matrix reads the edit's directions
+                if decoys:
+                    own = own_directions(name, norm)
+                    beside = (x * g) @ own.T  # and each of its decoys
+                    size = decoy_gain * alpha * torch.linalg.matrix_norm(read, 2)
+                    if weigh is not None:  # as large as each weighing asks, a size for each decoy
+                        size = (decoy_gain * alpha * torch.stack([to_the_stream(read, own, c) for c in weigh[norm]]).amax(0)).float()
+                        if not bool(torch.isfinite(size).all()):
+                            raise ValueError(f"the stream has nothing along a decoy of {name}: it cannot be sized by what it does to the stream")
+                    x -= (beside * (size / beside.norm(dim=0).clamp_min(1e-30))) @ (own * inv)
+                x -= alpha * read @ (basis * inv)
+                w = x.to(w.dtype)
+            tensors[name] = w
+        save_file(tensors, out_dir / ("head.safetensors" if layer is None else f"layer_{layer:03d}.safetensors"))
+    shutil.copyfile(base_dir / "config.json", out_dir / "config.json")
+    return out_dir
+
+
+@contextmanager
+def readers_from(lm: LM, folder: str | Path):
+    """Run ``lm`` from the reading matrices in ``folder`` (as ``blind_readers_on_disk`` writes
+    them) inside a block, and from its own again afterwards, restored exactly from CPU copies.
+
+    An edit that is made on disk and read from there by the reading-side pass can then be run
+    as well: what is measured of the model's behaviour is measured on the matrices that were
+    scored, whatever made them. Raises before anything is changed if the folder does not hold
+    every reading matrix of this model in its shape."""
+    from safetensors import safe_open
+
+    from . import detect  # which imports this module
+
+    index = detect._tensor_index(folder)
+    names = [name for name, _ in detect.reader_layout(index)]
+    own = {f"model.layers.{i}.{s}" for i in range(lm.n_layers) for s in detect.READERS} | {detect.HEAD}
+    head = lm.model.get_output_embeddings()
+
+    def target(name: str) -> torch.Tensor:
+        return head.weight if name == detect.HEAD else lm.model.get_parameter(name)
+
+    def shape(name: str) -> tuple:
+        with safe_open(index[name], "pt") as f:
+            return tuple(f.get_slice(name).get_shape())
+
+    if set(names) != own or any(name not in index or shape(name) != tuple(target(name).shape) for name in names):
+        raise ValueError(f"{folder} does not hold the reading matrices of this model")
+    untie_lm_head(lm)  # the folder's head is a matrix of its own
+    head = lm.model.get_output_embeddings()
+    snap = [target(name).detach().to("cpu", copy=True) for name in names]
+    try:
+        with torch.no_grad():
+            for name in names:
+                with safe_open(index[name], "pt") as f:
+                    target(name).data.copy_(f.get_tensor(name).to(target(name).dtype))
+        yield
+    finally:
+        for name, was in zip(names, snap):
+            target(name).data.copy_(was.to(target(name).device))
+
+
+@contextmanager
+def temporarily_blinded(lm: LM, direction: torch.Tensor, alpha: float = 1.0, layers: list[int] | None = None):
+    """Reader-side edit inside a block, restored exactly on exit from CPU copies of the
+    matrices it changes (for a 7B model and every layer, about 10 GB of host RAM)."""
+    targets = [lin.weight for _, lin in _readers(lm, layers)]
+    snap = [t.detach().to("cpu", copy=True) for t in targets]
+    try:
+        blind_readers(lm, direction, alpha, layers)
+        yield
+    finally:
+        for t, s in zip(targets, snap):
+            t.data.copy_(s.to(t.device))
+
+
+@contextmanager
+def blinded(lm: LM, direction: torch.Tensor, alpha: float = 1.0, layers: list[int] | None = None):
+    """``blind_readers`` at runtime: the same edit inside a block, as hooks on what each reader
+    is handed, with every weight left as it is.
+
+    An edited reader computes W' y from its input y = g * x / rms(x), and
+    W' y = W (y - alpha * ((y / g) B^T) (B * g)): changing what the matrix is handed does what
+    changing the matrix does. Unlike the weight edit this can be differentiated in
+    ``direction``, which a search for a direction needs; what the search ends on is then made
+    in the weights and measured there."""
+    basis = hooks.orthonormal(direction)
+
+    def behind(norm: nn.Module):
+        g = norm_gain(norm, lm.d_model)
+        inv = torch.where(g.abs() > 1e-6, 1.0 / g, torch.zeros_like(g))
+
+        def fn(y: torch.Tensor) -> torch.Tensor:
+            b = basis.to(y.device, y.dtype)
+            return y - alpha * ((y * inv.to(y.device, y.dtype)) @ b.T) @ (b * g.to(y.device, y.dtype))
+
+        return fn
+
+    with hooks.hooked(pre=[(lin, behind(norm)) for norm, lin in _readers(lm, layers, untie=False)]):
+        yield
+
+
 @dataclass
 class EditSpec:
     """A refusal-direction edit. ``direction`` is one vector or a list of vectors (a rank-k
-    subspace). ``mode`` is "weights" (orthogonalize) or "hooks" (runtime)."""
+    subspace). ``mode`` is "weights" (edit the matrices) or "hooks" (runtime). ``side`` says
+    which matrices a weights-mode edit changes: "writers" (orthogonalize) or "readers"
+    (blind_readers). Edits saved before ``side`` existed are writer-side."""
 
     direction: list[float] | list[list[float]]
     alpha: float = 1.0
@@ -153,6 +447,7 @@ class EditSpec:
     source_pos: int | None = None
     model: str = ""
     method: str = "diff_in_means"
+    side: str = "writers"
 
     @property
     def vector(self) -> torch.Tensor:
@@ -180,10 +475,18 @@ class EditSpec:
         """Permanently edit ``lm`` in memory (weights mode only)."""
         if self.mode != "weights":
             raise ValueError("use EditSpec.active() for hook-mode edits")
-        orthogonalize(lm, self.vector, self.alpha, self.layers)
+        if self.side == "writers":
+            orthogonalize(lm, self.vector, self.alpha, self.layers)
+        elif self.side == "readers":
+            blind_readers(lm, self.vector, self.alpha, self.layers)
+        else:
+            raise ValueError(f"side must be 'writers' or 'readers', not {self.side!r}")
 
     @contextmanager
     def active(self, lm: LM):
         """Runtime version of the edit; the model is untouched outside the block."""
-        with hooks.ablate(lm, self.vector, self.alpha, self.layers):
+        if self.side not in ("writers", "readers"):
+            raise ValueError(f"side must be 'writers' or 'readers', not {self.side!r}")
+        edit = hooks.ablate if self.side == "writers" else blinded
+        with edit(lm, self.vector, self.alpha, self.layers):
             yield

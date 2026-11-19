@@ -58,19 +58,24 @@ def energy_dimension(m: torch.Tensor, fraction: float = 0.9) -> int:
     return int((cum < fraction).sum().item()) + 1
 
 
-def spectrum_summary(m: torch.Tensor) -> dict[str, float]:
+def spectrum_summary(m: torch.Tensor, topk: tuple[int, ...] = ()) -> dict[str, float]:
+    """Spectral summary of ``m``. ``topk`` adds ``top{k}_energy``: the share of squared energy
+    in the k largest singular values (1.0 for any matrix of rank <= k)."""
     s = singular_values(m)
     s2 = s**2
     p = s / s.sum()
     p = p[p > 0]
     cum = s2.cumsum(0) / s2.sum()
-    return {
+    out = {
         "stable_rank": float(s2.sum() / s2[0]),
         "effective_rank": float(torch.exp(-(p * p.log()).sum())),
         "participation_ratio": float(s2.sum() ** 2 / (s2**2).sum()),
         "dim90": int((cum < 0.9).sum().item()) + 1,
         "top1_energy": float(s2[0] / s2.sum()),
     }
+    for k in topk:
+        out[f"top{k}_energy"] = float(cum[min(k, len(cum)) - 1])
+    return out
 
 
 # ---- linear probe ------------------------------------------------------------------------------

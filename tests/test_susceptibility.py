@@ -95,3 +95,27 @@ def test_sweep_runs_and_plots(tmp_path, tokenizer):
     assert (tmp_path / "f.png").stat().st_size > 0
     neg = [{**rows[0], det: 0.0} for det in sweep.DETECTORS for _ in range(1)]
     assert 0.0 <= sweep.frontier_auroc(rows, neg, "weight_top1_energy") <= 1.0
+
+
+def test_fpr_thresholds_and_benign_filter():
+    neg = [{"label": "benign_finetune", "activation_gap": i / 100} for i in range(40)]
+    rows = neg + [{"label": "abliterated", "activation_gap": 0.9}, {"label": "base", "activation_gap": 0.0}]
+    assert len(sweep.benign(rows)) == 40
+    t = sweep.fpr_thresholds(sweep.benign(rows), ["activation_gap", "missing"])
+    assert set(t) == {"activation_gap"}
+    assert sum(r["activation_gap"] > t["activation_gap"] for r in neg) == 2  # 5% of 40
+    # Too few negatives to resolve 5%: fall back to the largest benign score.
+    assert sweep.fpr_thresholds(neg[:10], ["activation_gap"])["activation_gap"] == 0.09
+
+
+def test_plot_frontier_overlays_checkpoints(tmp_path):
+    rows = [
+        {"k": 1, "band": "all", "alpha": 1.0, "bypass_rate": 0.9, "activation_gap": 0.3, "weight_top1_energy": 1.0},
+        {"k": 2, "band": "mid", "alpha": 0.5, "bypass_rate": 0.4, "activation_gap": 0.1, "weight_top1_energy": 0.5},
+    ]
+    ckpts = [
+        {"label": "abliterated", "bypass_rate": 1.0, "activation_gap": 0.2, "weight_top1_energy": 0.99},
+        {"label": "benign_finetune", "bypass_rate": 0.1, "activation_gap": 0.05, "weight_top1_energy": float("nan")},
+    ]
+    sweep.plot_frontier(rows, tmp_path / "f.png", {"activation_gap": 0.1}, ckpts)
+    assert (tmp_path / "f.png").stat().st_size > 0

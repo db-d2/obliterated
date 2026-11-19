@@ -33,7 +33,9 @@ def main() -> None:
     ap.add_argument("--alphas", default="0.25,0.5,0.75,1.0")
     ap.add_argument("--ks", default="1,2,4")
     ap.add_argument("--bands", default="all,mid,source,source±2")
-    ap.add_argument("--mode", default="hooks", choices=["hooks", "weights"])
+    ap.add_argument("--mode", default="hooks", choices=["hooks", "weights", "readers"],
+                    help="hooks: runtime ablation. weights: orthogonalize the writer matrices. readers: leave the "
+                         "writers alone and make the matrices that read the stream ignore the direction")
     ap.add_argument("--method", default="pca", choices=["pca", "iterative"])
     ap.add_argument("--source", default="arditi", choices=["arditi", "advbench", "harmbench"])
     ap.add_argument("--n-train", type=int, default=128)
@@ -81,13 +83,10 @@ def main() -> None:
 
     thresholds = None
     if args.negatives:
-        neg = sweep.read_rows(args.negatives)
-        thresholds = {}
-        for det in sweep.DETECTORS:
-            vals = sorted(r[det] for r in neg if det in r)
-            if vals:
-                thresholds[det] = vals[min(len(vals) - 1, int(0.95 * len(vals)))]
-                print(f"{det}: AUROC {sweep.frontier_auroc(rows, neg, det):.3f}")
+        neg = sweep.benign(sweep.read_rows(args.negatives))
+        thresholds = sweep.fpr_thresholds(neg)
+        for det in thresholds:
+            print(f"{det}: AUROC {sweep.frontier_auroc(rows, neg, det):.3f}")
     sweep.plot_frontier(sweep.read_rows(out / "frontier.jsonl"), out / "frontier.png", thresholds)
     for r in rows:
         print(

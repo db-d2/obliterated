@@ -24,6 +24,16 @@ def default_dtype(device: torch.device) -> torch.dtype:
     return torch.float32
 
 
+def release(device: torch.device) -> None:
+    """Hand the backend allocator's cached blocks back to the system. A loop over batches of
+    different shapes otherwise grows without limit on MPS, which keeps the buffers of every
+    shape it has seen: 13.5 GB held for a 5 GB model after three batches."""
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()
+
+
 def describe() -> str:
     d = best_device()
     parts = [f"device={d}", f"torch={torch.__version__}"]
