@@ -14,7 +14,7 @@ from obliterated.edits import (
 from obliterated.refusal import last_logits
 
 from .conftest import make_lm
-from .test_edits import PROMPTS, READABLE, rand_dir, uneven_gains
+from .test_edits import PROMPTS, READABLE, rand_dir, readers_and_head, uneven_gains
 from .test_reader_positives import saved
 from .test_readers import BASE_REV, pair, snapshot
 
@@ -184,6 +184,68 @@ def test_decoys_along_directions_the_stream_does_not_use_leave_what_a_matrix_mak
             name = f"model.layers.{i}.self_attn.{m}.weight"
             costs = float(((anywhere[name] - plain[name]) @ x.T).norm())
             assert costs > 0 and float(((unused[name] - plain[name]) @ x.T).norm()) < 1e-3 * costs, name
+
+
+# ---- leaving alone the coordinates a norm all but switches off
+
+OFF = (3, 17)
+
+
+@pytest.fixture
+def switched_off(tokenizer, tmp_path):
+    """A base whose every norm scales two coordinates to almost nothing, as Qwen 2.5's norms do a few of theirs."""
+    lm = make_lm("llama_untied", tokenizer)
+    uneven_gains(lm)
+    for norm in {id(n): n for n, _ in readers_and_head(lm)}.values():
+        norm.weight.data[list(OFF)] = torch.tensor([1e-3, -5e-3])
+    v = rand_dir(lm, 11)
+    return {"lm": lm, "folder": snapshot(tmp_path / "base", lm, BASE_REV), "v": v, "unit": (v / v.norm()).double(), "tmp": tmp_path}
+
+
+def test_columns_behind_a_gain_under_the_floor_are_left_as_they_are_by_the_edit_and_by_its_decoys(switched_off):
+    s = switched_off
+    was = saved(blind_readers_on_disk(s["folder"], s["tmp"] / "was", s["v"], alpha=0.0))
+    got = saved(blind_readers_on_disk(s["folder"], s["tmp"] / "floor", s["v"], decoys=4, seed=3, gain_floor=0.05))
+    kept = [i for i in range(s["lm"].d_model) if i not in OFF]
+    for name, _ in detect.reader_layout(detect._tensor_index(s["folder"])):
+        assert torch.equal(got[name][:, list(OFF)], was[name][:, list(OFF)]), name
+        assert bool((got[name][:, kept] != was[name][:, kept]).any(dim=0).all()), name  # and every other column is changed
+
+
+def test_under_a_floor_the_readers_ignore_as_much_of_the_direction_as_lies_on_the_other_coordinates(switched_off):
+    s = switched_off
+    was, got = (effective(blind_readers_on_disk(s["folder"], s["tmp"] / name, s["v"], alpha=alpha, gain_floor=0.05))
+                for name, alpha in (("was", 0.0), ("floor", 1.0)))
+    left = float(s["unit"][list(OFF)].pow(2).sum())  # the share of the direction on the two coordinates
+    assert 0 < left < 0.5
+    for name in got:
+        before = float((was[name] @ s["unit"]).norm())
+        assert float((got[name] @ s["unit"]).norm()) == pytest.approx(left * before, rel=1e-3), name
+
+
+def test_a_floor_keeps_the_stored_change_from_piling_up_on_a_coordinate_with_almost_no_gain(switched_off):
+    s = switched_off
+    directions = s["v"].repeat(s["lm"].n_layers, 1)
+    read = lambda name, **kw: record.read_readers(s["folder"], blind_readers_on_disk(s["folder"], s["tmp"] / name, s["v"], decoys=4, seed=3, **kw),
+                                                  directions, k=2)["fields"]
+    piled, spread = read("piled"), read("spread", gain_floor=0.05)
+    assert piled["reader_top1_energy"] > 0.9  # five directions were changed, and nearly all of the stored change is one
+    assert spread["reader_top1_energy"] < 0.5
+    assert spread["reader_shared_direction"] < 0.5  # and the decoys hide the direction as they did
+
+
+def test_no_floor_is_the_edit_as_it_was(switched_off):
+    s = switched_off
+    a = saved(blind_readers_on_disk(s["folder"], s["tmp"] / "a", s["v"], decoys=4, seed=3))
+    b = saved(blind_readers_on_disk(s["folder"], s["tmp"] / "b", s["v"], decoys=4, seed=3, gain_floor=0.0))
+    assert all(torch.equal(a[k], b[k]) for k in a)
+
+
+def test_a_floor_that_no_gain_is_under_changes_nothing(made):
+    """The gains of this base lie between 0.6 and 1.4: none is under a tenth of its norm's median."""
+    a = saved(blind_readers_on_disk(made["folder"], made["tmp"] / "a", made["v"], decoys=4, decoy_gain=GAIN, seed=3, avoid=made["avoid"].float(), gain_floor=0.1))
+    b = saved(made["paths"][1])
+    assert all(torch.equal(a[k], b[k]) for k in a)
 
 
 # ---- running a model from reading matrices on disk

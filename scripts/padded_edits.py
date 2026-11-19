@@ -22,6 +22,10 @@ least in where that matrix reads it, the edit's direction and the base's refusal
 base's own answer. <--out>/<direction>/<model>/stream.json says how much of the stream those
 directions hold, there and on the held-out prompts, and how much the edit's own direction does.
 
+With --gain-floor f, every variant is made without touching the columns of a matrix behind a
+gain under f times its norm's median (obliterated.edits.blind_readers_on_disk), and is named
+apart (<name>_f<f>), so that it stands beside the same variant made without.
+
 Each is made from the base's files, read against the base by the code that reads a checkpoint
 (obliterated.record.read_readers, keeping the first of --kept factors per matrix as the
 records do), and then run: the model is loaded once and, for each variant, runs from the very
@@ -97,6 +101,8 @@ def main() -> None:
     ap.add_argument("--least-used", type=ints, default=[0],
                     help="take a matrix's decoys from this many of the directions the stream has least in where it reads; 0 for any direction; several give a variant each")
     ap.add_argument("--stream-tokens", type=int, default=64, help="tokens of the base's own answer counted after each prompt where the stream is measured")
+    ap.add_argument("--gain-floor", type=float, default=0.0,
+                    help="leave a matrix's columns alone where the norm's gain is under this many times its median; the variants are named apart")
     ap.add_argument("--kept", type=ints, default=[8], help="factors a record keeps per matrix: the first as the records do, the rest for the shared-direction scores")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--gen-tokens", type=int, default=32, help="tokens generated for the refusal-phrase check")
@@ -140,6 +146,8 @@ def main() -> None:
     variants = [("plain", 1, 0, None, 0), *((f"shared_k{k}", k, 0, None, 0) for k in args.shared),
                 *((f"decoys_p{p}" + (f"_g{g}" if len(gains) > 1 else "") + (f"_n{n}" if n else ""), 1, p, g, n)
                   for n in args.least_used for g in gains for p in args.decoys)]
+    if args.gain_floor:
+        variants = [(f"{name}_f{args.gain_floor}", *rest) for name, *rest in variants]
     jobs = {args.model: {"repo": args.model, "base": args.model, "label": "base", "bypass_rate": 0.0}}
     jobs |= {f"{args.model}#{source.name}+{name}": {"repo": f"{args.model}#{source.name}+{name}", "base": args.model, "label": "reader_edit",
                                                     "direction": source.name, "variant": name} for name, *_ in variants}
@@ -152,7 +160,7 @@ def main() -> None:
         "model": args.model, "base_revision": pinned["base_revision"], "base_files": pinned["base_files"], "directions_from": repos[0],
         "direction": str(found[0]), "direction_sha256": hashlib.sha256(found[0].read_bytes()).hexdigest(),
         "span": {"path": str(span_path), "sha256": hashlib.sha256(span_path.read_bytes()).hexdigest()},
-        "decoy_gains": gains, "least_used": args.least_used, "stream_tokens": args.stream_tokens, "kept": args.kept, "seed": args.seed, "alpha": 1.0, "band": "all",
+        "decoy_gains": gains, "least_used": args.least_used, "stream_tokens": args.stream_tokens, "gain_floor": args.gain_floor, "kept": args.kept, "seed": args.seed, "alpha": 1.0, "band": "all",
         "made_at": datetime.now(UTC).isoformat(timespec="seconds"), "versions": versions}, indent=1))
 
     if todo or wanted:
@@ -185,7 +193,8 @@ def main() -> None:
         for name, k, p, gain, n in todo:
             started, edit, job = time.time(), scratch / f"{slug}_{name}", f"{args.model}#{source.name}+{name}"
             try:
-                blind_readers_on_disk(base_dir, edit, rows[:k], decoys=p, decoy_gain=gain or 1.0, seed=args.seed, avoid=span["basis"], among=among.get(n))
+                blind_readers_on_disk(base_dir, edit, rows[:k], decoys=p, decoy_gain=gain or 1.0, seed=args.seed, avoid=span["basis"], among=among.get(n),
+                                      gain_floor=args.gain_floor)
                 row = done.get(name)
                 if row is None:
                     read = record.read_readers(base_dir, edit, directions, args.kept[0], span=span)
@@ -205,7 +214,7 @@ def main() -> None:
                 shutil.rmtree(edit, ignore_errors=True)
             if row is None:
                 row = {"name": name, "model": args.model, "direction": source.name, "k": k, "decoys": p, "decoy_gain": gain,
-                       "decoys_among": n or None, "stream_share": used[str(n)]["share"] if n else None,
+                       "decoys_among": n or None, "gain_floor": args.gain_floor or None, "stream_share": used[str(n)]["share"] if n else None,
                        "stream_share_heldout": used[str(n)]["share_heldout"] if n else None,
                        "alpha": 1.0, "band": "all", "n_harmful": len(h_val), **does, **read["fields"], **more}
                 sweep.write_rows([row], table)

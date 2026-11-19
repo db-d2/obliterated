@@ -222,7 +222,7 @@ def _gain_on_disk(stored: torch.Tensor, gemma: bool, eps: float) -> torch.Tensor
 def blind_readers_on_disk(
     base_dir: str | Path, out_dir: str | Path, direction: torch.Tensor, alpha: float = 1.0, layers: list[int] | None = None,
     decoys: int = 0, decoy_gain: float = 1.5, seed: int = 0, avoid: torch.Tensor | None = None,
-    among: dict[str, torch.Tensor] | None = None,
+    among: dict[str, torch.Tensor] | None = None, gain_floor: float = 0.0,
 ) -> Path:
     """``blind_readers`` from a snapshot's files to files, without loading a model: the
     reading matrices the edited model would have, bit for bit, in the precision the base
@@ -249,7 +249,13 @@ def blind_readers_on_disk(
     direction serves a decoy as far as the weights go, but not as far as the model goes: a
     change along a direction the stream has little in does little, whatever its size in the
     weights. ``stream.least_used`` gives such directions. An error, before anything is
-    written, if an edited matrix's norm has too few."""
+    written, if an edited matrix's norm has too few.
+
+    With ``gain_floor``, the columns of a matrix are left as they are wherever the norm in
+    front of it has a gain smaller, in size, than that many times its median gain. The stored
+    matrix changes along a direction divided by the gain, so a coordinate the norm all but
+    switches off takes most of the stored change while the reader gets next to nothing through
+    it. Leaving it alone gives up only the part of a direction that lies on that coordinate."""
     from safetensors import safe_open
     from safetensors.torch import save_file
 
@@ -296,7 +302,7 @@ def blind_readers_on_disk(
             tensors[norm] = stored(norm)
             if in_band(layer):
                 g = _gain_on_disk(tensors[norm], gemma, eps)
-                inv = torch.where(g.abs() > 1e-6, 1.0 / g, torch.zeros_like(g))
+                inv = torch.where(g.abs() > max(1e-6, gain_floor * float(g.abs().median())), 1.0 / g, torch.zeros_like(g))
                 x = w.float()
                 read = (x * g) @ basis.T  # how the matrix reads the edit's directions
                 if decoys:

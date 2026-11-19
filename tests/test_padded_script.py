@@ -178,3 +178,18 @@ def test_a_second_run_with_another_number_of_directions_keeps_what_the_first_wro
     made = json.loads((setup["rows"].parent / "stream.json").read_text())
     assert set(made["least_used"]) == {"8", "12"}
     assert made["least_used"]["8"]["share"] <= made["least_used"]["12"]["share"]  # four more directions, each used no less
+
+
+def test_a_gain_floor_gives_every_variant_a_row_of_its_own_made_with_it(setup, monkeypatch):
+    real, floors = setup["script"].blind_readers_on_disk, []
+
+    def spy(*args, **kwargs):
+        floors.append(kwargs.get("gain_floor"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(setup["script"], "blind_readers_on_disk", spy)
+    rows = run(setup, monkeypatch, "--gain-floor", "0.1")
+    assert list(rows) == ["plain_f0.1", "shared_k2_f0.1", "decoys_p3_f0.1"]
+    assert all(r["gain_floor"] == 0.1 for r in rows.values()) and floors == [0.1] * 3
+    rows = run(setup, monkeypatch)  # and without one, the edits as they were, beside them
+    assert list(rows)[3:] == ["plain", "shared_k2", "decoys_p3"] and rows["plain"]["gain_floor"] is None and floors[3:] == [0.0] * 3
