@@ -407,7 +407,7 @@ def refusal_span(directions: Tensor, n_controls: int = 32, seed: int = 0, tol: f
 
 def scan_readers(
     base_dir: str | Path, cand_dir: str | Path, directions: Tensor, k: int = 8, rows: int = 4096,
-    span: Tensor | None = None,
+    span: Tensor | None = None, grams: bool = False,
 ) -> Iterator[dict]:
     """What changed in every matrix that reads the residual stream, from two local snapshots,
     a slice of rows at a time: no model is loaded and nothing larger than a slice is held.
@@ -455,7 +455,11 @@ def scan_readers(
       fine-tune's is not rounding noise; it is exactly zero for an untouched reader.
 
     The factors come from (d_model, d_model) Gram matrices accumulated in float64, and
-    ``gram_top``. With the gain unchanged, E's is the stored matrix's scaled by g g^T."""
+    ``gram_top``. With the gain unchanged, E's is the stored matrix's scaled by g g^T.
+
+    With ``grams``, the Gram matrix of the change in E is yielded as well (``gram_eff``, float64),
+    for a caller that decomposes it some other way (``stream.weighted_factors``). With ``k`` of
+    0 nothing is decomposed here and no factors or spectrum summaries are yielded."""
     import json
 
     from safetensors import safe_open
@@ -519,13 +523,16 @@ def scan_readers(
             out["gain_cand"] = gc
         if on_span is not None:
             out["span_base"], out["span_change"] = on_span[0], on_span[1]
-        if out["changed"]:
+        if out["changed"] and k:
             out["s"], out["u"], out["summary"] = _factors(gram, name, k)
         if finite and (out["changed"] or moved):
             if not moved:
                 gram_eff = gram * torch.outer(gb, gb).double()
             if float(gram_eff.diagonal().sum()) > 0:
-                out["es"], out["eu"], out["summary_eff"] = _factors(gram_eff, name, k)
+                if grams:
+                    out["gram_eff"] = gram_eff
+                if k:
+                    out["es"], out["eu"], out["summary_eff"] = _factors(gram_eff, name, k)
         yield out
 
 

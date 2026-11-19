@@ -25,28 +25,33 @@ Tensor = torch.Tensor
 
 
 @torch.no_grad()
-def moments(lm: LM, texts: list[str], batch_size: int = 16) -> tuple[dict[str, Tensor], int]:
-    """The second moment of the stream in front of every norm a reading matrix sits behind,
-    over every token of ``texts``, and how many tokens that was.
+def measure(lm: LM, texts: list[str], batch_size: int = 16) -> tuple[dict[str, Tensor], dict[str, Tensor], int]:
+    """The mean and the second moment of the stream in front of every norm a reading matrix
+    sits behind, over every token of ``texts``, and how many tokens that was.
 
     A text is tokenized as it stands (``lm.format`` an instruction first, and append an answer
     to have the positions of an answer counted). For each norm, under the name its weight has
-    on disk (what ``detect.reader_layout`` pairs a matrix with), a (d_model, d_model) float64
-    matrix: the mean over tokens of the outer product of x / rms(x) with itself, x being what
-    the norm is handed. Its trace is d_model, so along an average direction it is 1, and r C r
-    for a unit r is the mean square of what the stream has along r. Padding is not counted.
-    The sums are taken on the CPU in float64: the smallest of these numbers are the ones that
-    are wanted, beside others many orders larger."""
+    on disk (what ``detect.reader_layout`` pairs a matrix with), with x what the norm is handed:
+
+    - the mean over tokens of x / rms(x), (d_model,), float64
+    - the mean over tokens of the outer product of x / rms(x) with itself, (d_model, d_model),
+      float64. Its trace is d_model, so along an average direction it is 1, and r C r for a
+      unit r is the mean square of what the stream has along r.
+
+    Padding is not counted. The sums are taken on the CPU in float64: the smallest of these
+    numbers are the ones that are wanted, beside others many orders larger."""
     name_of = {id(module): name for name, module in lm.model.named_modules()}
     norms = {f"{name_of[id(norm)]}.weight": norm for norm, _ in _readers(lm, None, untie=False)}
-    total = {name: torch.zeros(lm.d_model, lm.d_model, dtype=torch.float64) for name in norms}
+    first = {name: torch.zeros(lm.d_model, dtype=torch.float64) for name in norms}
+    second = {name: torch.zeros(lm.d_model, lm.d_model, dtype=torch.float64) for name in norms}
     batch = {}
 
     def counting(name: str):
         def fn(x: Tensor) -> Tensor:
             y = x[batch["mask"]].float().cpu().double()
             y = y / y.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-30)
-            total[name] += y.T @ y
+            first[name] += y.sum(0)
+            second[name] += y.T @ y
             return x
 
         return fn
@@ -58,7 +63,13 @@ def moments(lm: LM, texts: list[str], batch_size: int = 16) -> tuple[dict[str, T
             batch["mask"] = enc["attention_mask"].bool().to(lm.device)
             lm.model(**{k: v.to(lm.device) for k, v in enc.items()})
             n += int(enc["attention_mask"].sum())
-    return {name: t / n for name, t in total.items()}, n
+    return {name: t / n for name, t in first.items()}, {name: t / n for name, t in second.items()}, n
+
+
+def moments(lm: LM, texts: list[str], batch_size: int = 16) -> tuple[dict[str, Tensor], int]:
+    """The second moments of ``measure`` and its count of tokens."""
+    _, second, n = measure(lm, texts, batch_size)
+    return second, n
 
 
 def least_used(moment: Tensor, n: int, avoid: Tensor | None = None) -> Tensor:
@@ -83,3 +94,53 @@ def share(moment: Tensor, rows: Tensor) -> float:
     by ``moment``: n / d_model for n directions the stream uses as much as any others."""
     r = rows.double()
     return float((r @ moment.double() @ r.T).diagonal().sum() / moment.double().diagonal().sum())
+
+
+def root(moment: Tensor, mean: Tensor | None = None, cap: float | None = None) -> Tensor:
+    """The symmetric square root of what a change is weighed by, (d_model, d_model), float64.
+
+    A change D to a matrix composed with its norm adds D x to what the matrix makes of a token
+    x, and over the stream the mean square of that is the trace of D C D^T: the squared size
+    of D ``root``, where ``root`` squares to the stream's second moment C (one of ``measure``).
+    So D ``root`` is the change as the stream meets it, a direction counting for as much as
+    the stream has along it.
+
+    - with ``mean`` (the other output of ``measure``), the variance about the mean in place of
+      the second moment: what the stream has along a direction on every token alike is left out
+    - with ``cap``, no direction is weighed above ``cap`` times the average one: a direction
+      the stream hardly uses still counts for little, and one it uses most counts for no more
+      than the rest."""
+    c = moment.double()
+    if mean is not None:
+        c = c - torch.outer(mean.double(), mean.double())
+    values, vectors = torch.linalg.eigh((c + c.T) / 2)
+    values = values.clamp_min(0)
+    if cap is not None:
+        values = values.clamp_max(cap * float(values.mean()))
+    return (vectors * values.sqrt()) @ vectors.T
+
+
+def weighted_factors(gram: Tensor, root: Tensor, k: int = 8, tol: float = 1e-10) -> tuple[Tensor, Tensor]:
+    """The largest parts of a change as the stream meets it, and what each reads off the stream.
+
+    ``gram`` is the Gram matrix D^T D of a change D on its input side (``detect.scan_readers``
+    with ``grams``) and ``root`` one of ``root``. D ``root`` is decomposed, and for each of its
+    k largest singular values, with left factor u, the direction D^T u is what that part of the
+    change reads: for a change u r^T it is r itself, whatever the weighing.
+
+    Returns ``(values, directions)``: the singular values, largest first, and a (d_model, k)
+    matrix with orthonormal columns whose first j span what the j largest parts read. Both in
+    float64. Only parts above ``tol`` of the largest, in squared value, are returned, so a
+    change of lower rank gives fewer than k.
+
+    With the identity for ``root`` these are the change's own singular values and input-side
+    singular vectors. The weights alone cannot tell a change along a direction the stream
+    never has anything in from one that matters; weighed by the stream, the first is small."""
+    g, r = gram.double(), root.double()
+    values, vectors = torch.linalg.eigh(r @ g @ r)
+    values, vectors = values.flip(0)[:k].clamp_min(0), vectors.flip(1)[:, :k]
+    found = int((values > tol * float(values[0])).sum()) if len(values) and float(values[0]) > 0 else 0
+    values, vectors = values[:found], vectors[:, :found]
+    reads = g @ (r @ vectors)  # D^T (D root v), a column for each part: D^T u up to its length
+    reads = reads / reads.norm(dim=0, keepdim=True).clamp_min(1e-300)
+    return values.sqrt(), torch.linalg.qr(reads).Q

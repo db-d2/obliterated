@@ -190,6 +190,53 @@ def test_a_changed_norm_gain_changes_what_the_matrices_behind_it_read(tokenizer,
         assert ("eu" in f) == (f["name"] in behind) and "u" not in f  # it changed what they do, not what is stored
 
 
+def acting(folder: Path) -> dict[str, torch.Tensor]:
+    """Every reading matrix of an untied Llama snapshot composed with its norm, in float64."""
+    got = load_file(folder / "model.safetensors")
+    return {name: got[name].double() * got[norm].double() for name, norm in detect.reader_layout(detect._tensor_index(folder))}
+
+
+def test_the_gram_matrix_of_the_change_in_what_acts_on_the_stream_is_handed_over_when_asked_for(tokenizer, tmp_path):
+    """Whether the stored matrix changed, the gain in front of it, or both."""
+    base, cand = pair("llama_untied", tokenizer)
+    blind_readers(cand, direction(base), layers=[0, 2])
+    cand.layers[1].input_layernorm.weight.data[::2] *= 1.5
+    cand.layers[2].input_layernorm.weight.data[::2] *= 1.5
+    b, c = snapshot(tmp_path / "base", base, BASE_REV), snapshot(tmp_path / "cand", cand)
+    directions = direction(base).repeat(base.n_layers + 1, 1)
+    found = {f["name"]: f for f in detect.scan_readers(b, c, directions, grams=True)}
+    before, after = acting(b), acting(c)
+    kinds = set()
+    for name, f in found.items():
+        change = after[name] - before[name]
+        if not f["changed"] and not f["gain_changed"]:
+            assert "gram_eff" not in f and float(change.abs().max()) == 0, name
+            continue
+        kinds.add((f["changed"], f["gain_changed"]))
+        assert f["gram_eff"].dtype == torch.float64
+        torch.testing.assert_close(f["gram_eff"], change.T @ change, atol=1e-6 * float(change.norm() ** 2), rtol=0)
+    assert kinds == {(True, False), (False, True), (True, True)}
+    assert not any("gram_eff" in f for f in detect.scan_readers(b, c, directions))  # only when asked for
+
+
+def test_no_factors_are_worked_out_when_none_are_asked_for(tokenizer, tmp_path, monkeypatch):
+    base, cand = pair("llama_untied", tokenizer)
+    blind_readers(cand, direction(base))
+    b, c = snapshot(tmp_path / "base", base, BASE_REV), snapshot(tmp_path / "cand", cand)
+    directions = direction(base).repeat(base.n_layers + 1, 1)
+    with_factors = list(detect.scan_readers(b, c, directions, grams=True))
+
+    def decomposed(*a, **k):
+        raise AssertionError("a Gram matrix was decomposed")
+
+    monkeypatch.setattr(detect, "gram_top", decomposed)
+    found = list(detect.scan_readers(b, c, directions, k=0, grams=True))
+    assert len(found) == len(with_factors)
+    for f, w in zip(found, with_factors):
+        assert f["changed"] and not {"s", "u", "summary", "es", "eu", "summary_eff"} & f.keys(), f["name"]
+        assert torch.equal(f["gram_eff"], w["gram_eff"]) and torch.equal(f["read_cand"], w["read_cand"])
+
+
 def test_the_head_is_compared_over_the_tokens_both_sides_have(tmp_path):
     """A base that ties its head to the embedding does not store one; a fine-tune that added
     tokens stores a longer one."""
