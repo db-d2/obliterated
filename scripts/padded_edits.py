@@ -30,6 +30,12 @@ the stream, and a decoy that is large in the weights and does little then ranks 
 stream, under its second moment and under its variance, no less than that many times what the
 edit does (obliterated.edits.blind_readers_on_disk). Those variants are named apart (<name>_e).
 
+With --detector-stream, a folder holding a detector's own measurement of the base's stream
+(scripts/weighted_readers.py --measure, on prompts other than the ones decoys are chosen on),
+every row also has the shared-direction score with each change weighed by that measurement, at
+the sizes that pass keeps (obliterated.record.weighted_shared_scores). A row that was made
+without it is not made again.
+
 With --gain-floor f, every variant is made without touching the columns of a matrix behind a
 gain under f times its norm's median (obliterated.edits.blind_readers_on_disk), and is named
 apart (<name>_f<f>), so that it stands beside the same variant made without.
@@ -116,6 +122,8 @@ def main() -> None:
     ap.add_argument("--gain-floor", type=float, default=0.0,
                     help="leave a matrix's columns alone where the norm's gain is under this many times its median; the variants are named apart")
     ap.add_argument("--kept", type=ints, default=[8], help="factors a record keeps per matrix: the first as the records do, the rest for the shared-direction scores")
+    ap.add_argument("--detector-stream", default=None,
+                    help="folder of a detector's measurements of the stream (scripts/weighted_readers.py): the scores weighed by it are added to every row")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--gen-tokens", type=int, default=32, help="tokens generated for the refusal-phrase check")
     ap.add_argument("--answers", type=int, default=0, help="JailbreakBench prompts to answer in full for the judges")
@@ -134,6 +142,8 @@ def main() -> None:
         raise SystemExit("--least-used: fewer directions than there are decoys to take from them")
     if args.skip_least_used and not any(args.least_used):
         raise SystemExit("--skip-least-used: there are no --least-used directions to skip in")
+    if args.detector_stream and not stream.path(args.detector_stream, args.model).exists():
+        raise SystemExit(f"--detector-stream: {args.detector_stream} holds no measurement of {args.model}")
     out.mkdir(parents=True, exist_ok=True)
 
     found = sorted((source / slug).glob("subspace_*.json"))
@@ -211,6 +221,7 @@ def main() -> None:
             (out / "stream.json").write_text(json.dumps({**made, "least_used": {**(before["least_used"] if same else {}), **used},
                                                          "made_at": datetime.now(UTC).isoformat(timespec="seconds"), "versions": versions}, indent=1))
             del seen, held
+        detector = None  # what a detector weighs a change by, worked out when the first row needs it
         for name, k, p, gain, n in todo:
             started, edit, job = time.time(), scratch / f"{slug}_{name}", f"{args.model}#{source.name}+{name}"
             try:
@@ -224,6 +235,10 @@ def main() -> None:
                     more = {f"{key}_k{n}": value for n in args.kept[1:]
                             for key, value in record.shared_scores(record.read_readers(base_dir, edit, directions, n)["kept"]).items()
                             if key != "reader_shared_n"}
+                    if args.detector_stream:
+                        if detector is None:
+                            detector = stream.roots(stream.load(stream.path(args.detector_stream, args.model))[1])
+                        more |= record.weighted_shared_scores(record.weighted_readers(base_dir, edit, detector))
                 with readers_from(lm, edit):
                     if row is None:
                         h = refusal_score_from_logits(last_logits(lm, h_val, bs), ids)

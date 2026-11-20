@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from obliterated import completions, record, sweep, unlisted
+from obliterated import completions, record, stream, sweep, unlisted
 from obliterated.edits import EditSpec
 from obliterated.models import load
 
@@ -252,3 +252,19 @@ def test_decoys_sized_by_what_they_do_to_the_stream_get_rows_of_their_own(setup,
     assert list(rows)[3:] == ["decoys_p3"] and rows["decoys_p3"]["decoys_by_effect"] is None
     assert rows["decoys_p3"]["reader_fro_norm"] != rows["decoys_p3_e"]["reader_fro_norm"]
     assert given[f"{SLUG}_decoys_p3"].get("weigh") is None
+
+
+def test_with_a_detectors_measurement_of_the_stream_every_row_has_the_weighted_scores_as_well(setup, monkeypatch):
+    lm = load(str(setup["folder"]), device="cpu")
+    means, moments, _ = stream.measure(lm, [lm.format(p) for p in PROMPTS])
+    folder = setup["out"].parent / "detector"
+    with pytest.raises(SystemExit, match="measurement"):  # before a model is loaded or anything is made
+        run(setup, monkeypatch, "--detector-stream", str(folder))
+    folder.mkdir()
+    stream.save(stream.path(folder, BASE), means, moments)
+    rows = run(setup, monkeypatch, "--detector-stream", str(folder))
+    assert list(rows) == ["plain", "shared_k2", "decoys_p3"]
+    for r in rows.values():
+        assert r["reader_weighted_shared_n"] == r["reader_shared_n"]
+        assert 0.0 <= r["reader_weighted_shared_k8"] <= r["reader_weighted_shared_k128"] + 1e-4 <= 1.0 + 2e-4  # kept in half precision
+    assert rows["plain"]["reader_weighted_shared_k8"] == pytest.approx(1.0, abs=1e-3)
