@@ -15,7 +15,11 @@ matrix composed with its norm.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 from . import hooks
 from .edits import _readers
@@ -72,6 +76,27 @@ def moments(lm: LM, texts: list[str], batch_size: int = 16) -> tuple[dict[str, T
     return second, n
 
 
+def path(folder: str | Path, base: str) -> Path:
+    """The file in ``folder`` that holds the measurement of ``base``'s stream. What it was
+    measured on is for whoever measures it to say, in a .json beside it."""
+    return Path(folder) / f"{base.replace('/', '__')}.safetensors"
+
+
+def save(path: str | Path, means: dict[str, Tensor], moments: dict[str, Tensor]) -> None:
+    """What ``measure`` returned, as one safetensors file: ``mean.<norm>`` and ``moment.<norm>``, as they are."""
+    save_file({**{f"mean.{norm}": t for norm, t in means.items()}, **{f"moment.{norm}": t for norm, t in moments.items()}}, str(path))
+
+
+def load(path: str | Path) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
+    """The means and the second moments of a file that ``save`` wrote."""
+    means, moments = {}, {}
+    with safe_open(str(path), "pt") as f:
+        for key in f.keys():  # noqa: SIM118  (not a dict)
+            kind, norm = key.split(".", 1)
+            (means if kind == "mean" else moments)[norm] = f.get_tensor(key)
+    return means, moments
+
+
 def least_used(moment: Tensor, n: int, avoid: Tensor | None = None, skip: int = 0) -> Tensor:
     """The ``n`` orthonormal directions along which ``moment`` (one of ``moments``) is
     smallest, as rows, (n, d_model), float32, the least used first. With ``avoid``, rows of
@@ -119,6 +144,12 @@ def root(moment: Tensor, mean: Tensor | None = None, cap: float | None = None) -
     if cap is not None:
         values = values.clamp_max(cap * float(values.mean()))
     return (vectors * values.sqrt()) @ vectors.T
+
+
+def roots(moments: dict[str, Tensor], means: dict[str, Tensor] | None = None) -> dict[str, Tensor]:
+    """``root`` for every norm of a measurement: what a change behind each norm is weighed by.
+    With ``means``, by the variance about the mean."""
+    return {norm: root(c, mean=None if means is None else means[norm]) for norm, c in moments.items()}
 
 
 def weighted_factors(gram: Tensor, root: Tensor, k: int = 8, tol: float = 1e-10) -> tuple[Tensor, Tensor]:

@@ -189,6 +189,23 @@ def fpr_thresholds(
     return out
 
 
+def flagged_by(row: dict, thresholds: dict[str, float]) -> list[str]:
+    """The detectors of ``thresholds`` whose score in ``row`` is strictly above its threshold,
+    in the order the thresholds are given. Scores that are used together flag a checkpoint
+    when this is not empty. A score that is missing or not a number flags nothing."""
+    return [det for det, threshold in thresholds.items() if det in row and row[det] > threshold]
+
+
+def held_out(negatives: list[dict], detectors: Iterable[str] = DETECTORS, fpr: float = 0.05) -> list[list[str]]:
+    """For each of ``negatives`` in turn, what it is ``flagged_by`` when the thresholds are set
+    by the others (``fpr_thresholds``). Thresholds flag at most ``fpr`` of the negatives they
+    were set on by construction, and every further score that is used gives a negative one
+    more threshold to be above; this counts what that comes to on negatives the thresholds
+    have not seen."""
+    detectors = tuple(detectors)
+    return [flagged_by(r, fpr_thresholds(negatives[:i] + negatives[i + 1:], detectors, fpr)) for i, r in enumerate(negatives)]
+
+
 def plot_frontier(
     rows: list[dict],
     path: str | Path,

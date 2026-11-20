@@ -29,7 +29,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file, save_file
 
-from . import completions, detect
+from . import completions, detect, stream
 
 REVISION = re.compile(r"[0-9a-f]{40}")
 ROW_KEYS = ("n_harmful", "bypass_rate", "baseline_bypass_rate", "activation_gap", "behaviour_kl_harmful", "behaviour_refusal_drop")
@@ -208,6 +208,62 @@ def shared_scores(kept: dict[str, torch.Tensor]) -> dict[str, float]:
         return {"reader_shared_direction": 0.0, "reader_shared_subspace": 0.0, "reader_shared_n": n}
     agree = lambda rows: max(0.0, (float(torch.linalg.svdvals(torch.cat(rows))[0]) ** 2 - 1) / (n - 1))
     return {"reader_shared_direction": agree(tops), "reader_shared_subspace": agree(alls), "reader_shared_n": n}
+
+
+WEIGHTED_SIZES = (8, 128)
+WEIGHTED_SCORES = tuple(f"reader_weighted_shared_k{k}" for k in WEIGHTED_SIZES)
+
+
+def weighted_readers(base_dir: str | Path, cand_dir: str | Path, roots: dict[str, torch.Tensor],
+                     k: int = max(WEIGHTED_SIZES)) -> dict[str, torch.Tensor]:
+    """What a record keeps of each reading matrix's change once the change is weighed by the
+    base's stream, from two folders of weights. No model is loaded.
+
+    ``shared_scores`` reads the strongest input-side factors of each change, and strongest
+    there means largest in the weights. An editor can put changes beside the edit that are
+    larger in the weights and lie along directions the stream has next to nothing in: they cost
+    the model nothing and take the edit's place among the factors that are kept. A detector
+    that has the base's activations as well as its weights can order the parts of a change by
+    what they do to the stream instead.
+
+    ``roots`` is, for every norm a reading matrix sits behind, what a change behind it is
+    weighed by (``stream.roots`` of the detector's own measurement of the base, on prompts of
+    its choosing). For every changed reading matrix of the layers, ``<name>.wu``: the
+    directions that the ``k`` largest parts of its weighed change read off the stream
+    (``stream.weighted_factors``), as columns, the largest first, in half precision as the other
+    factors of a record are kept. The first j columns are what a record of j would hold, so one
+    record gives the score at every size up to ``k``. A change of lower rank gives fewer
+    columns. The output head is left out, as ``shared_scores`` leaves it out.
+
+    An error if a changed matrix sits behind a norm that ``roots`` does not have."""
+    d = json.loads((Path(base_dir) / "config.json").read_text())["hidden_size"]
+    kept = {}
+    for m in detect.scan_readers(base_dir, cand_dir, torch.zeros(0, d), k=0, grams=True):  # no direction is named
+        if "gram_eff" not in m or detect.layer_of(m["name"]) is None:
+            continue
+        if m["norm"] not in roots:
+            raise ValueError(f"{m['norm']}: the stream was not measured in front of this norm, which {m['name']} sits behind")
+        _, read = stream.weighted_factors(m["gram_eff"], roots[m["norm"]], k=k)
+        kept[f"{m['name']}.wu"] = read.half()
+    return kept
+
+
+def weighted_shared_scores(kept: dict[str, torch.Tensor], sizes: tuple[int, ...] = WEIGHTED_SIZES) -> dict[str, float]:
+    """Whether the reading matrices a checkpoint changed were changed along one input direction,
+    with each change weighed by the stream: ``shared_scores`` on what ``weighted_readers`` keeps.
+
+    - ``reader_weighted_shared_k<size>``, for each of ``sizes``: ``reader_shared_subspace`` over
+      the first ``size`` kept directions of every matrix (all of them where a matrix has fewer)
+    - ``reader_weighted_shared_n``: how many matrices were compared
+
+    More than one size, because how many directions a detector keeps is something an editor can
+    plan for, and what pushes an edit out of a few kept directions is not what hides it among
+    many. The sizes are meant to be used together: a checkpoint is flagged when its score at
+    any of them is above that size's threshold (``sweep.flagged_by``). Only ``.wu`` entries are
+    read, so the tensors of a reader record may be in ``kept`` as well."""
+    weighed = {key[:-3] + ".eu": u for key, u in kept.items() if key.endswith(".wu")}
+    out = {f"reader_weighted_shared_k{k}": shared_scores({key: u[:, :k] for key, u in weighed.items()})["reader_shared_subspace"] for k in sizes}
+    return {**out, "reader_weighted_shared_n": sum(detect.layer_of(key) is not None for key in weighed)}
 
 
 SPAN_SCORES = ("reader_span_read_drop", "reader_span_read_drop_med", "reader_span_head_read_drop", "reader_span_last_read_drop",
