@@ -82,7 +82,8 @@ def test_an_edit_among_larger_decoys_is_found_when_the_stream_has_little_along_t
     assert weighted(made, plain, roots, 2) == pytest.approx(1.0, abs=1e-3)
     assert unweighted(made, hidden, 2) < 0.3  # 0.14
     assert weighted(made, hidden, roots, 2) > 0.7  # 0.83
-    first = [abs(float(u[:, 0].double() @ made["unit"])) for u in record.weighted_readers(made["folder"], hidden, roots, k=1).values()]
+    first = [abs(float(u[:, 0].double() @ made["unit"]))
+             for key, u in record.weighted_readers(made["folder"], hidden, roots, k=1).items() if key.endswith(".wu")]
     assert min(first) > 0.6 and sorted(first)[len(first) // 2] > 0.85  # 0.71 and 0.91
     assert weighted(made, hidden, roots, 5) == pytest.approx(1.0, abs=1e-3)  # with all five parts kept the direction is in every matrix
 
@@ -107,11 +108,44 @@ def test_what_is_kept_is_each_changed_layer_matrix_in_half_precision_and_not_the
     hidden = made["paths"][1]
     names = [name for name in layout(made) if name != "lm_head.weight"]
     got = record.weighted_readers(made["folder"], hidden, alike(made), k=3)
-    assert set(got) == {f"{name}.wu" for name in names}  # the edit changes the head as well
-    for u in got.values():
-        assert u.dtype == torch.float16 and u.shape == (made["base"].d_model, 3)
+    assert set(got) == {f"{name}.{part}" for name in names for part in ("wu", "ws", "wt")}  # the edit changes the head as well
+    for name in names:
+        assert got[f"{name}.wu"].dtype == torch.float16 and got[f"{name}.wu"].shape == (made["base"].d_model, 3)
     band = blind_readers_on_disk(made["folder"], made["tmp"] / "band", made["v"], layers=[1])
-    assert set(record.weighted_readers(made["folder"], band, alike(made))) == {f"{name}.wu" for name in names if ".layers.1." in name}
+    assert {key for key in record.weighted_readers(made["folder"], band, alike(made)) if key.endswith(".wu")} == {
+        f"{name}.wu" for name in names if ".layers.1." in name}
+
+
+def test_the_size_of_each_part_is_kept_beside_what_it_reads_and_the_size_of_the_whole(made):  # noqa: F811
+    """The edit and four decoys are five parts of every matrix's change. Three kept are less
+    than the whole; with every part kept that is above rounding, they are the whole."""
+    hidden, roots = made["paths"][1], mostly_along_the_edit(made)
+    got = record.weighted_readers(made["folder"], hidden, roots, k=3)
+    every = record.weighted_readers(made["folder"], hidden, roots, k=made["base"].d_model)
+    names = [key[:-3] for key in got if key.endswith(".wu")]
+    assert names
+    for name in names:
+        sizes, whole = got[f"{name}.ws"].double(), float(got[f"{name}.wt"])
+        assert sizes.shape == (got[f"{name}.wu"].shape[1],) and bool((sizes[:-1] >= sizes[1:]).all()) and float(sizes[-1]) > 0
+        assert float(sizes.pow(2).sum()) < 0.999 * whole
+        assert float(every[f"{name}.ws"].double().pow(2).sum()) == pytest.approx(whole, rel=1e-5)
+        assert float(every[f"{name}.wt"]) == pytest.approx(whole, rel=1e-12)
+
+
+def test_the_changes_own_factors_are_kept_as_well_when_asked_for(made):  # noqa: F811
+    """Not weighed by anything, under the names the reader pass keeps its eight by: the score
+    that reads the weights alone can be had from them at any size up to what is kept, and
+    their sizes are the ones the reader pass found another way."""
+    hidden = made["paths"][1]
+    got = record.weighted_readers(made["folder"], hidden, mostly_along_the_edit(made), k=2, unweighed=True)
+    assert {key.rsplit(".", 1)[1] for key in got} == {"wu", "ws", "wt", "es", "eu"}
+    own = {key: u for key, u in got.items() if key.endswith(".eu")}
+    assert all(u.dtype == torch.float16 and u.shape == (made["base"].d_model, 2) for u in own.values())
+    assert record.shared_scores(own)["reader_shared_subspace"] == pytest.approx(unweighted(made, hidden, 2), abs=2e-3)
+    read = record.read_readers(made["folder"], hidden, made["v"].repeat(made["base"].n_layers, 1), k=2)["kept"]
+    for key in own:
+        torch.testing.assert_close(got[key[:-3] + ".es"], read[key[:-3] + ".es"], rtol=1e-4, atol=0)
+    assert not any(key.endswith((".es", ".eu")) for key in record.weighted_readers(made["folder"], hidden, alike(made), k=2))
 
 
 def test_weights_that_did_not_change_keep_nothing_and_score_nothing(made):  # noqa: F811
@@ -148,6 +182,39 @@ def test_the_stream_as_it_is_measured_and_saved_weighs_the_matrices_behind_each_
     by_the_weights, by_the_stream = score(alike), score(stream.roots(read_moments))
     assert by_the_weights["reader_weighted_shared_k1"] < 0.3 and by_the_stream["reader_weighted_shared_k1"] > 0.7  # 0.13 and 0.78
     assert by_the_stream["reader_weighted_shared_n"] == 5 * lm.n_layers
+
+
+def test_roots_taken_from_a_file_one_norm_at_a_time_are_the_roots_of_the_whole_measurement(tokenizer, tmp_path):
+    lm = make_lm("llama_untied", tokenizer)
+    means, moments, _ = stream.measure(lm, [lm.format(p) for p in PROMPTS[:2]])
+    stream.save(tmp_path / "stream.safetensors", means, moments)
+    got, want = stream.load_roots(tmp_path / "stream.safetensors"), stream.roots(moments)
+    assert set(got) == set(want) and len(got) == 2 * lm.n_layers + 1
+    for norm in want:
+        assert torch.equal(got[norm], want[norm])
+
+
+def test_with_nothing_to_weigh_by_the_parts_are_the_changes_own():
+    d = torch.randn(7, 12, dtype=torch.float64, generator=torch.Generator().manual_seed(0))
+    values, reads = stream.weighted_factors(d.T @ d, None, k=3)
+    _, s, vh = torch.linalg.svd(d)
+    torch.testing.assert_close(values, s[:3])
+    torch.testing.assert_close((reads.T @ vh[:3].T).abs(), torch.eye(3, dtype=torch.float64), atol=1e-8, rtol=0)
+    alike_values, alike_reads = stream.weighted_factors(d.T @ d, torch.eye(12, dtype=torch.float64), k=3)
+    torch.testing.assert_close(values, alike_values)
+    torch.testing.assert_close((reads.T @ alike_reads).abs(), torch.eye(3, dtype=torch.float64), atol=1e-8, rtol=0)
+
+
+def test_the_size_of_the_whole_weighed_change_is_given_when_asked_for():
+    g = torch.Generator().manual_seed(1)
+    d, a = torch.randn(7, 12, dtype=torch.float64, generator=g), torch.randn(12, 12, dtype=torch.float64, generator=g)
+    root = stream.root(a.T @ a)
+    values, reads, whole = stream.weighted_factors(d.T @ d, root, k=3, total=True)
+    assert whole == pytest.approx(float((d @ root).pow(2).sum()), rel=1e-10)
+    assert float(values.pow(2).sum()) < whole
+    again = stream.weighted_factors(d.T @ d, root, k=3)
+    assert len(again) == 2 and torch.equal(again[0], values) and torch.equal(again[1], reads)
+    assert stream.weighted_factors(d.T @ d, None, k=12, total=True)[2] == pytest.approx(float(d.pow(2).sum()), rel=1e-10)
 
 
 def test_a_bases_measurement_has_a_file_of_its_own_in_a_folder():

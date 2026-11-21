@@ -4,6 +4,7 @@ change weighed by its base's stream, for checkpoints already read by reader_weig
     uv run python scripts/weighted_readers.py --rows runs/detect/readers_span/qwen25.jsonl --out runs/detect/weighted/qwen25.jsonl
     uv run python scripts/weighted_readers.py --rows runs/detect/readers_span/qwen25.jsonl --out runs/detect/weighted/qwen25.jsonl --measure
     uv run python scripts/weighted_readers.py --check --rows runs/detect/readers_span/qwen25.jsonl --out runs/detect/weighted/qwen25.jsonl
+    uv run python scripts/weighted_readers.py --rows runs/detect/readers_span/llama31.jsonl --out runs/detect/weighted/llama31.jsonl --evict --unweighed
     uv run python scripts/weighted_readers.py --report runs/detect/weighted/qwen25.jsonl
 
 The shared-direction score of the reader pass (obliterated.record.shared_scores) reads the
@@ -23,12 +24,23 @@ edits are checked on. Nothing a model wrote is kept, only sums over its activati
 
 Scoring is a weights-only pass like the reader pass: tensors are streamed from the safetensors
 files on the CPU. It reads the revision that pass pinned (<--rows dir>/record/) and only what
-is on disk with the files that pass read: nothing is downloaded and nothing is deleted. Per
-checkpoint it writes one row to --out and record/<repo>.safetensors with its .json beside it:
-the first 128 directions of every changed reading matrix, in half precision, and what was read,
+is on disk with the files that pass read. Unless it is asked to, it downloads nothing and
+deletes nothing. Per checkpoint it writes one row to --out and record/<repo>.safetensors with
+its .json beside it: the first 128 directions of every changed reading matrix, in half
+precision, the size of each of those parts and of the whole weighed change, and what was read,
 with which measurement of the stream and which code. The row has the score with the first 8
-of those directions and with all 128 (reader_weighted_shared_k8, _k128). --check works every
-row out again from its record, without reading any weights.
+of those directions and with all 128 (reader_weighted_shared_k8, _k128).
+
+--fetch downloads a checkpoint that is not on disk, at the pinned revision; what comes down has
+to be the files the reader pass read. --evict (which fetches) deletes a checkpoint from the
+Hugging Face cache once what was kept of it has been read back and validated
+(obliterated.record.validate_weighted), and only if this pass downloaded it: the downloads it
+starts are listed in <--out>.downloaded.json before they begin, so an interrupted one is still
+recognised. Bases are never fetched and never deleted. The next checkpoint downloads while the
+current one is read. --unweighed also keeps the 128 largest factors of each change as it is in
+the weights, which the reader pass kept 8 of: once the weights are gone they cannot be had
+again, and their sizes are checked against that pass's. --check validates every row of --out
+again, without reading any weights.
 
 The two sizes are for use together. --report sets a threshold for each from the benign
 fine-tunes in the files it is given (with --judged, those the grader still finds refusing: a
@@ -42,20 +54,28 @@ from __future__ import annotations
 
 import argparse
 import functools
-import hashlib
 import json
+import shutil
+import threading
 import time
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 
-from safetensors.torch import load_file
+from huggingface_hub import constants
 
 from obliterated import data, record, stream, sweep
 from obliterated.generate import generate
 from obliterated.models import load, unload
-from obliterated.registry import snapshot_folder
+from obliterated.registry import bases, evict, fetch, load_registry, snapshot_folder
 
 N_KEPT = max(record.WEIGHTED_SIZES)
+PARTS = ("wu", "ws", "wt")  # of each changed matrix: what its weighed change reads, the size of each part, and of the whole
+OWN = ("es", "eu")  # with --unweighed: the sizes and directions of the change as it is in the weights
+
+
+class LeftOut(Exception):
+    """Why a checkpoint is not scored by this run."""
 
 
 @functools.cache
@@ -89,14 +109,18 @@ def measure(base: str, revision: str, folder: str | Path, n: int, tokens: int, s
         "made_at": datetime.now(UTC).isoformat(timespec="seconds"), "versions": versions()}, indent=1))
 
 
-def check(row: dict, out: Path) -> list[str]:
-    """What a row's record does not reproduce of it."""
-    path = record.tensors_path(out, row["repo"])
-    if not path.exists():
-        return ["no record of what was kept"]
-    again = record.weighted_shared_scores(load_file(path))
-    return [f"{key}: the row has {row.get(key)} and the record gives {value}" for key, value in again.items()
-            if not isinstance(row.get(key), (int, float)) or abs(row[key] - value) > 1e-9]
+def prefetch(repo: str, revision: str) -> threading.Thread:
+    """Start downloading ``repo`` in the background. A failure here is left for the pass
+    itself to hit and report."""
+    def run() -> None:
+        try:
+            fetch(repo, revision=revision)
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
 
 
 def report(files: list[Path], judged: str | Path | None, margin: float, fpr: float) -> dict:
@@ -140,7 +164,14 @@ def main() -> None:
     ap.add_argument("--base", nargs="+", default=None, help="only fine-tunes of these bases")
     ap.add_argument("--repo", nargs="+", default=None, help="only these checkpoints")
     ap.add_argument("--limit", type=int, default=None, help="stop after this many checkpoints")
-    ap.add_argument("--check", action="store_true", help="work out every row of --out again from its record, then exit")
+    ap.add_argument("--redo", action="store_true", help="score checkpoints again that are already in --out")
+    ap.add_argument("--fetch", action="store_true", help="download a checkpoint that is not on disk, at the revision the reader pass read")
+    ap.add_argument("--evict", action="store_true",
+                    help="delete each checkpoint this pass downloaded once what was kept of it validates; implies --fetch")
+    ap.add_argument("--min-free-gb", type=float, default=60.0, help="stop before a download if the cache disk has less free")
+    ap.add_argument("--unweighed", action="store_true",
+                    help="also keep the 128 largest factors of each change as it is in the weights, and check their sizes against the reader pass's")
+    ap.add_argument("--check", action="store_true", help="validate what was kept for every row of --out, then exit")
     ap.add_argument("--report", nargs="+", default=None, help="results files of this pass: thresholds and what is flagged, then exit")
     ap.add_argument("--judged", default="runs/detect/judged.jsonl", help="for --report: file written by judge_checkpoints.py, if it exists")
     ap.add_argument("--margin", type=float, default=0.3, help="for --report: a benign fine-tune sets thresholds if judged under this far above its base")
@@ -155,56 +186,127 @@ def main() -> None:
     if args.check:
         bad = 0
         for r in sweep.read_rows(out):
-            problems = check(r, out)
+            problems = record.validate_weighted(r, out, rows_file)
             bad += bool(problems)
             print(f"{'PROBLEMS' if problems else 'ok':<9}{r['repo']}" + "".join(f"\n    - {p}" for p in problems), flush=True)
         raise SystemExit(1 if bad else 0)
+    if args.evict:
+        args.fetch = True
     versions()  # now, before a long run during which the sources may be edited
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    done = {r["repo"] for r in sweep.read_rows(out)} if out.exists() else set()
+    done = set() if args.redo or not out.exists() else {r["repo"] for r in sweep.read_rows(out)}
     todo = sorted((r for r in sweep.read_rows(rows_file)
                    if r.get("label") != "base" and r["repo"] != r["base"] and r["repo"] not in done
                    and (args.base is None or r["base"] in args.base) and (args.repo is None or r["repo"] in args.repo)),
                   key=lambda r: (r["base"], r["repo"]))[: args.limit]
+    pins = {r["repo"]: json.loads(record.provenance_path(rows_file, r["repo"]).read_text()) for r in todo}
+    keep = bases(load_registry())
+    mine_path = out.with_suffix(".downloaded.json")
+    mine = set(json.loads(mine_path.read_text())) if mine_path.exists() else set()
+
+    def here(r: dict) -> bool:
+        return on_disk(snapshot_folder(r["repo"], pins[r["repo"]]["revision"]), pins[r["repo"]]["files"])
+
+    def claim(r: dict) -> None:
+        """Note, before its download can start, that this pass is the one fetching ``r``."""
+        if r["repo"] not in mine and not here(r):
+            mine.add(r["repo"])
+            mine_path.write_text(json.dumps(sorted(mine), indent=1))
+
+    def ready(r: dict) -> str | None:
+        """Why ``r`` cannot be scored whatever is downloaded, if it cannot."""
+        pin = pins[r["repo"]]
+        if not on_disk(snapshot_folder(r["base"], pin["base_revision"]), pin["base_files"]):
+            return f"its base {r['base']} is not on disk with the files the reader pass read"
+        if not stream.path(args.stream, r["base"]).exists() and not args.measure:
+            return f"the stream of {r['base']} is not measured (--measure)"
+        return None
+
+    failed, kept_back = [], []
+    arriving: threading.Thread | None = None
     roots, weighed = None, {}
     for i, r in enumerate(todo):
-        repo, base = r["repo"], r["base"]
-        pin = json.loads(record.provenance_path(rows_file, repo).read_text())
-        cand_dir, base_dir = snapshot_folder(repo, pin["revision"]), snapshot_folder(base, pin["base_revision"])
-        if not on_disk(cand_dir, pin["files"]) or not on_disk(base_dir, pin["base_files"]):
-            print(f"[{i + 1}/{len(todo)}] {repo}: not on disk with the files the reader pass read; left out", flush=True)
+        repo, base, pin = r["repo"], r["base"], pins[r["repo"]]
+        if arriving is not None:
+            arriving.join()  # this checkpoint's own download, started during the one before
+            arriving = None
+        if (why := ready(r)) is not None:
+            print(f"[{i + 1}/{len(todo)}] {repo}: {why}; left out", flush=True)
             continue
-        path = stream.path(args.stream, base)
-        if not path.exists():
-            if not args.measure:
-                print(f"[{i + 1}/{len(todo)}] {repo}: the stream of {base} is not measured (--measure); left out", flush=True)
-                continue
-            measure(base, pin["base_revision"], args.stream, args.n, args.tokens, args.seed, args.batch_size, args.device)
-        if weighed.get("base") != base:
-            roots = None  # the last base's, before the next are worked out
-            made = json.loads(path.with_suffix(".json").read_text()) if path.with_suffix(".json").exists() else None
-            if made is not None and made["base_revision"] != pin["base_revision"]:
-                raise SystemExit(f"{path} was measured on {base} at {made['base_revision']}, and {repo} was read against {pin['base_revision']}")
-            roots = stream.roots(stream.load(path)[1])
-            weighed = {"base": base, "path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "made": made}
+        if args.fetch:
+            free = shutil.disk_usage(constants.HF_HUB_CACHE).free / 1e9
+            if not here(r) and free < args.min_free_gb:
+                print(f"stopping: {free:.0f} GB free on the cache disk, below --min-free-gb {args.min_free_gb:.0f}", flush=True)
+                break
+            claim(r)
+            nxt = todo[i + 1] if i + 1 < len(todo) else None
+            if nxt is not None and ready(nxt) is None and not here(nxt):
+                claim(nxt)
+                arriving = prefetch(nxt["repo"], pins[nxt["repo"]]["revision"])
         started = time.time()
-        kept = record.weighted_readers(base_dir, cand_dir, roots, k=N_KEPT)
-        row = {"repo": repo, "base": base, "label": r.get("label"), "family": r.get("family"), "params_b": r.get("params_b"),
-               "revision": pin["revision"], **record.weighted_shared_scores(kept)}
-        record.write(out, repo, kept, {
-            "repo": repo, "base": base, "label": r.get("label"), "revision": pin["revision"], "files": pin["files"],
-            "base_revision": pin["base_revision"], "base_files": pin["base_files"], "reader_record": str(record.tensors_path(rows_file, repo)),
-            "n_kept": N_KEPT, "weighed_by": "second moment", "stream": {k: v for k, v in weighed.items() if k != "base"},
-            "scored_at": datetime.now(UTC).isoformat(timespec="seconds"), "versions": versions()})
+        try:
+            cand_dir, base_dir = snapshot_folder(repo, pin["revision"]), snapshot_folder(base, pin["base_revision"])
+            if not on_disk(cand_dir, pin["files"]):
+                if not args.fetch:
+                    raise LeftOut("not on disk with the files the reader pass read")
+                fetch(repo, revision=pin["revision"])
+                cand_dir = snapshot_folder(repo, pin["revision"])
+                if not on_disk(cand_dir, pin["files"]):
+                    raise LeftOut("what was downloaded is not the files the reader pass read")
+            path = stream.path(args.stream, base)
+            if not path.exists():
+                measure(base, pin["base_revision"], args.stream, args.n, args.tokens, args.seed, args.batch_size, args.device)
+            if weighed.get("base") != base:
+                roots = None  # the last base's, before the next are worked out
+                made = json.loads(path.with_suffix(".json").read_text()) if path.with_suffix(".json").exists() else None
+                if made is not None and made["base_revision"] != pin["base_revision"]:
+                    raise SystemExit(f"{path} was measured on {base} at {made['base_revision']}, and {repo} was read against {pin['base_revision']}")
+                roots = stream.load_roots(path)
+                weighed = {"base": base, "path": str(path.resolve()), "sha256": record.file_sha256(path), "made": made}
+            kept = record.weighted_readers(base_dir, cand_dir, roots, k=N_KEPT, unweighed=args.unweighed)
+            info, base_info = record.snapshot_info(cand_dir), record.snapshot_info(base_dir)
+            row = {"repo": repo, "base": base, "label": r.get("label"), "family": r.get("family"), "params_b": r.get("params_b"),
+                   "revision": info["revision"], **record.weighted_shared_scores(kept)}
+            record.write(out, repo, kept, {
+                "repo": repo, "base": base, "label": r.get("label"), "revision": info["revision"], "files": info["files"],
+                "base_revision": base_info["revision"], "base_files": base_info["files"],
+                "reader_record": str(record.tensors_path(rows_file, repo)),
+                "n_kept": N_KEPT, "parts": [*PARTS, *(OWN if args.unweighed else ())], "weighed_by": "second moment",
+                "stream": {k: v for k, v in weighed.items() if k != "base"},
+                "scored_at": datetime.now(UTC).isoformat(timespec="seconds"), "versions": versions()})
+        except LeftOut as e:
+            print(f"[{i + 1}/{len(todo)}] {repo}: {e}; left out", flush=True)
+            continue
+        except Exception as e:  # noqa: BLE001 - one broken or vanished upload should not end a long batch
+            traceback.print_exc()
+            failed.append((repo, f"{type(e).__name__}: {e}"))
+            continue
         sweep.write_rows([row], out)
-        problems = check(sweep.read_rows(out)[-1], out)  # what is on disk, not in memory
+        problems = record.validate_weighted(sweep.read_rows(out)[-1], out, rows_file)  # what is on disk, not in memory
         print(f"[{i + 1}/{len(todo)}] {repo[:56]:<56} {row['reader_weighted_shared_n']:>3} matrices | "
               + " | ".join(f"{k} kept {row[f'reader_weighted_shared_k{k}']:.3f}" for k in record.WEIGHTED_SIZES)
-              + f"; {time.time() - started:.0f}s" + "".join(f"\n    - {p}" for p in problems), flush=True)
+              + f"; {time.time() - started:.0f}s", flush=True)
+        print(f"    what was kept of {repo}: " + ("validated" if not problems else "".join(f"\n    - {p}" for p in problems)), flush=True)
+        if problems:
+            kept_back.append(repo)
+        if not args.evict:
+            continue
+        if problems:  # nothing is deleted until what replaces it has been checked
+            print(f"    kept on disk: {repo} did not validate", flush=True)
+        elif repo in keep:
+            print(f"    kept on disk: {repo} is the base of another checkpoint", flush=True)
+        elif repo not in mine:
+            print(f"    kept on disk: {repo} was there before this pass", flush=True)
+        else:
+            print(f"    deleted {repo} from the cache: {evict(repo, keep) / 1e9:.1f} GB freed", flush=True)
+
     if not todo:
         print("nothing to read", flush=True)
-
+    for repo, err in failed:
+        print(f"FAILED {repo}: {err}", flush=True)
+    if kept_back:
+        print(f"{len(kept_back)} checkpoints have a record that did not validate:\n" + "".join(f"  {repo}\n" for repo in kept_back), end="", flush=True)
 
 if __name__ == "__main__":
     main()

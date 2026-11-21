@@ -18,6 +18,7 @@ reads them back from disk and the weights are deleted only if it finds nothing w
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import math
@@ -215,7 +216,7 @@ WEIGHTED_SCORES = tuple(f"reader_weighted_shared_k{k}" for k in WEIGHTED_SIZES)
 
 
 def weighted_readers(base_dir: str | Path, cand_dir: str | Path, roots: dict[str, torch.Tensor],
-                     k: int = max(WEIGHTED_SIZES)) -> dict[str, torch.Tensor]:
+                     k: int = max(WEIGHTED_SIZES), unweighed: bool = False) -> dict[str, torch.Tensor]:
     """What a record keeps of each reading matrix's change once the change is weighed by the
     base's stream, from two folders of weights. No model is loaded.
 
@@ -235,6 +236,16 @@ def weighted_readers(base_dir: str | Path, cand_dir: str | Path, roots: dict[str
     record gives the score at every size up to ``k``. A change of lower rank gives fewer
     columns. The output head is left out, as ``shared_scores`` leaves it out.
 
+    Beside the directions, ``<name>.ws``: the size of each of those parts, the singular values
+    of the weighed change, and ``<name>.wt``: the squared size of the whole weighed change, so
+    how much of it the kept parts are can be said without the weights.
+
+    With ``unweighed``, also the ``k`` largest factors of the change as it is, weighed by
+    nothing: ``<name>.es`` and ``<name>.eu``, which the reader pass keeps eight of under those
+    names (``read_readers``). ``shared_scores`` reads them, at any size up to ``k``; and the
+    sizes are the ones the reader pass found by another route, which is a check that both
+    passes read the same change (``validate_weighted``).
+
     An error if a changed matrix sits behind a norm that ``roots`` does not have."""
     d = json.loads((Path(base_dir) / "config.json").read_text())["hidden_size"]
     kept = {}
@@ -243,8 +254,12 @@ def weighted_readers(base_dir: str | Path, cand_dir: str | Path, roots: dict[str
             continue
         if m["norm"] not in roots:
             raise ValueError(f"{m['norm']}: the stream was not measured in front of this norm, which {m['name']} sits behind")
-        _, read = stream.weighted_factors(m["gram_eff"], roots[m["norm"]], k=k)
-        kept[f"{m['name']}.wu"] = read.half()
+        sizes, read, whole = stream.weighted_factors(m["gram_eff"], roots[m["norm"]], k=k, total=True)
+        kept[f"{m['name']}.wu"], kept[f"{m['name']}.ws"] = read.half(), sizes
+        kept[f"{m['name']}.wt"] = torch.tensor(whole, dtype=torch.float64)
+        if unweighed:
+            sizes, own = stream.weighted_factors(m["gram_eff"], None, k=k)
+            kept[f"{m['name']}.es"], kept[f"{m['name']}.eu"] = sizes.float(), own.half()
     return kept
 
 
@@ -618,6 +633,99 @@ def _span_problems(row: dict, made: dict, kept: dict[str, torch.Tensor], matrice
                                                                               row["reader_read_drop"], tol=5e-3):
         problems.append(f"the read drop at the last position is {row.get('reader_span_last_read_drop')} from the span "
                         f"and {row['reader_read_drop']} read directly")
+    return problems
+
+
+@functools.lru_cache(maxsize=16)
+def _sha256(path: str, size: int, changed: int) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 24), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def file_sha256(path: str | Path) -> str:
+    """The sha256 of a file's contents, read a block at a time (a measurement of the stream is
+    gigabytes) and worked out once for as long as the file's size and time of change stay."""
+    stat = Path(path).stat()
+    return _sha256(str(Path(path).resolve()), stat.st_size, stat.st_mtime_ns)
+
+
+def validate_weighted(row: dict, out: str | Path, readers_out: str | Path) -> list[str]:
+    """Everything wrong with what the weighted pass saved for ``row``'s checkpoint
+    (``weighted_readers``, as ``scripts/weighted_readers.py`` writes it); empty means the
+    weights it was made from are no longer needed for it. Reads only from disk.
+
+    ``readers_out`` is the results file of the reader pass, which read the same checkpoint
+    before. The two have to describe the same weights, so the revision and the weight files
+    (name, size and content hash) must be the ones recorded there, for the checkpoint and for
+    its base. Which matrices changed is the reader pass's to say: each of them must be here,
+    and no other, with what its change reads as orthonormal columns, no more of them than
+    were to be kept. Where the size of each part and of the whole were kept, they must go with
+    the directions. Where the change's own factors were kept as well, their sizes must be the
+    ones the reader pass found by another route, to a thousandth of the largest. The
+    measurement of the stream the record was made with must still be on disk and be the same
+    file. And the record must give back the row's scores."""
+    out, repo = Path(out), row["repo"]
+    problems = [f"{k} is not finite" for k, v in row.items()
+                if k.startswith("reader_weighted_") and isinstance(v, float) and not math.isfinite(v)]
+    info, read = _json(provenance_path(out, repo)), _json(provenance_path(readers_out, repo)) or {}
+    if info is None or not tensors_path(out, repo).exists():
+        return [*problems, f"no record of what was kept for {repo} beside {out.name}"]
+    for key in ("revision", "base_revision"):
+        if not REVISION.fullmatch(str(info.get(key))):
+            problems.append(f"provenance: {key} is not a pinned commit ({info.get(key)!r})")
+        elif info[key] != read.get(key):
+            problems.append(f"{key}: the weights read are at {info[key][:12]}, the reader pass read {str(read.get(key))[:12]}")
+    for key, whose in (("files", "checkpoint"), ("base_files", "base")):
+        if not _weights(info.get(key)) or _weights(info.get(key)) != _weights(read.get(key)):
+            problems.append(f"the {whose}'s weights are not the files the reader pass read")
+    made = info.get("stream") or {}
+    measurement = Path(made.get("path") or "")
+    if not made or not measurement.is_file():
+        problems.append(f"the measurement of the stream the record was made with is not on disk ({made.get('path')})")
+    elif file_sha256(measurement) != made.get("sha256"):
+        problems.append(f"the measurement of the stream at {measurement} is not the file the record was made with")
+    n_kept = info.get("n_kept")
+    if not isinstance(n_kept, int) or n_kept < max(WEIGHTED_SIZES):
+        return [*problems, f"{n_kept} directions were to be kept of each matrix, and the scores need {max(WEIGHTED_SIZES)}"]
+
+    kept = load_file(tensors_path(out, repo))
+    problems += [f"{k} in the record is not finite" for k, v in kept.items() if not torch.isfinite(v.float()).all()]
+    if not tensors_path(readers_out, repo).exists():
+        return [*problems, f"no reader record for {repo} beside {Path(readers_out).name}: which matrices changed is not known"]
+    before = load_file(tensors_path(readers_out, repo))
+    changed = {k.removesuffix(".es") for k in before if k.endswith(".es") and detect.layer_of(k) is not None}
+    here = {k.removesuffix(".wu") for k in kept if k.endswith(".wu")}
+    problems += [f"{name}: it changed, and what its change reads is not in the record" for name in sorted(changed - here)]
+    problems += [f"{name}: in the record, and the reader pass found it unchanged" for name in sorted(here - changed)]
+    parts = info.get("parts") or ["wu"]  # a record made before sizes were kept has the directions alone
+    for name in sorted(here):
+        lost = [f"{name}.{part}" for part in parts if f"{name}.{part}" not in kept]
+        if lost:
+            problems.append(f"{', '.join(lost)}: not in the record")
+            continue
+        u = kept[f"{name}.wu"].float()
+        if u.dim() != 2 or u.shape[1] > n_kept:
+            problems.append(f"{name}: what its change reads has the shape {tuple(u.shape)}, with {n_kept} directions to keep")
+            continue
+        if u.shape[1] and float((u.T @ u - torch.eye(u.shape[1])).abs().max()) > 1e-2:
+            problems.append(f"{name}: what its change reads is not kept as orthonormal columns")
+        if "ws" in parts:
+            sizes = kept[f"{name}.ws"].double()
+            if sizes.shape != (u.shape[1],) or bool((sizes[:-1] < sizes[1:]).any()) or (len(sizes) and float(sizes[-1]) <= 0):
+                problems.append(f"{name}: the sizes of its parts do not go with the {u.shape[1]} directions kept")
+            elif "wt" in parts and float(sizes.pow(2).sum()) > float(kept[f"{name}.wt"]) * (1 + 1e-6):
+                problems.append(f"{name}: the size of its whole weighed change is below what its kept parts carry")
+        if "es" in parts:
+            own, was = kept[f"{name}.es"].double(), before.get(f"{name}.es", torch.zeros(0)).double()
+            n = min(len(own), len(was))
+            if kept[f"{name}.eu"].shape != (u.shape[0], len(own)) or not n or float((own[:n] - was[:n]).abs().max()) > 1e-3 * float(was[0]):
+                problems.append(f"{name}: the sizes of its change are not the ones the reader pass found")
+    for key, value in weighted_shared_scores(kept).items():
+        if not isinstance(row.get(key), (int, float)) or not abs(row[key] - value) <= 1e-9:
+            problems.append(f"{key}: the row says {row.get(key)}, the record gives {value}")
     return problems
 
 

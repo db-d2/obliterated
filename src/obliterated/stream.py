@@ -152,7 +152,20 @@ def roots(moments: dict[str, Tensor], means: dict[str, Tensor] | None = None) ->
     return {norm: root(c, mean=None if means is None else means[norm]) for norm, c in moments.items()}
 
 
-def weighted_factors(gram: Tensor, root: Tensor, k: int = 8, tol: float = 1e-10) -> tuple[Tensor, Tensor]:
+def load_roots(path: str | Path) -> dict[str, Tensor]:
+    """``roots`` of the second moments in a file that ``save`` wrote, taken one norm at a time.
+    The measurement of a model 4096 wide is nine gigabytes and its roots as much again; this
+    holds the roots and one norm's moment, not both whole."""
+    out = {}
+    with safe_open(str(path), "pt") as f:
+        for key in f.keys():  # noqa: SIM118  (not a dict)
+            kind, norm = key.split(".", 1)
+            if kind == "moment":
+                out[norm] = root(f.get_tensor(key))
+    return out
+
+
+def weighted_factors(gram: Tensor, root: Tensor | None, k: int = 8, tol: float = 1e-10, total: bool = False) -> tuple:
     """The largest parts of a change as the stream meets it, and what each reads off the stream.
 
     ``gram`` is the Gram matrix D^T D of a change D on its input side (``detect.scan_readers``
@@ -163,16 +176,23 @@ def weighted_factors(gram: Tensor, root: Tensor, k: int = 8, tol: float = 1e-10)
     Returns ``(values, directions)``: the singular values, largest first, and a (d_model, k)
     matrix with orthonormal columns whose first j span what the j largest parts read. Both in
     float64. Only parts above ``tol`` of the largest, in squared value, are returned, so a
-    change of lower rank gives fewer than k.
+    change of lower rank gives fewer than k. With ``total``, a third: the squared size of the
+    whole weighed change, which the squares of all its singular values add up to.
 
     With the identity for ``root`` these are the change's own singular values and input-side
-    singular vectors. The weights alone cannot tell a change along a direction the stream
-    never has anything in from one that matters; weighed by the stream, the first is small."""
-    g, r = gram.double(), root.double()
-    values, vectors = torch.linalg.eigh(r @ g @ r)
+    singular vectors, and with None for it they are worked out as that, with nothing to
+    multiply by. The weights alone cannot tell a change along a direction the stream never has
+    anything in from one that matters; weighed by the stream, the first is small."""
+    g = gram.double()
+    r = None if root is None else root.double()
+    weighed = g if r is None else r @ g @ r
+    values, vectors = torch.linalg.eigh(weighed)
     values, vectors = values.flip(0)[:k].clamp_min(0), vectors.flip(1)[:, :k]
     found = int((values > tol * float(values[0])).sum()) if len(values) and float(values[0]) > 0 else 0
     values, vectors = values[:found], vectors[:, :found]
-    reads = g @ (r @ vectors)  # D^T (D root v), a column for each part: D^T u up to its length
-    reads = reads / reads.norm(dim=0, keepdim=True).clamp_min(1e-300)
-    return values.sqrt(), torch.linalg.qr(reads).Q
+    if r is None:
+        reads = vectors  # of D^T D itself: its eigenvectors are what the parts read
+    else:
+        reads = g @ (r @ vectors)  # D^T (D root v), a column for each part: D^T u up to its length
+        reads = torch.linalg.qr(reads / reads.norm(dim=0, keepdim=True).clamp_min(1e-300)).Q
+    return (values.sqrt(), reads, float(weighed.diagonal().sum())) if total else (values.sqrt(), reads)
