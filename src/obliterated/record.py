@@ -729,6 +729,69 @@ def validate_weighted(row: dict, out: str | Path, readers_out: str | Path) -> li
     return problems
 
 
+ANSWER_TENSORS = ("answer.drop", "answer.kl", "answer.lengths")
+
+
+def validate_answers(row: dict, out: str | Path, main_out: str | Path) -> list[str]:
+    """Everything wrong with what the whole-answer pass saved for ``row``'s checkpoint
+    (``scripts/answer_divergence.py``); empty means the weights it was made from are no longer
+    needed for it. Reads only from disk.
+
+    ``main_out`` is the results file of the main pass, which scored the same checkpoint before.
+    The two have to describe the same weights, so the revision and the weight files (name, size
+    and content hash) must be the ones recorded there, for the checkpoint and for its base,
+    and the prompts must be that pass's. The record holds the two numbers at every token of
+    the base's answers and the length of every answer: they must be finite, as many as the
+    answers have tokens, and give back the row's numbers. The base's answers the numbers were
+    taken over must still be on disk with those lengths. And the first-token KL on harmful
+    prompts that this pass measured again must be the main pass's, to 1% or 0.002: a
+    checkpoint loaded some other way than that pass loaded it would differ there."""
+    out, repo = Path(out), row["repo"]
+    made, pin = _json(provenance_path(out, repo)), _json(provenance_path(main_out, repo)) or {}
+    if made is None or not tensors_path(out, repo).exists():
+        return [f"no record of what was kept for {repo} beside {out.name}"]
+    problems = []
+    for key in ("revision", "base_revision"):
+        if not REVISION.fullmatch(str(made.get(key))):
+            problems.append(f"provenance: {key} is not a pinned commit ({made.get(key)!r})")
+        elif made[key] != pin.get(key):
+            problems.append(f"{key}: the weights read are at {made[key][:12]}, the main pass scored {str(pin.get(key))[:12]}")
+    if row.get("revision") != made.get("revision"):
+        problems.append(f"revision: the row says {row.get('revision')}, the record {made.get('revision')}")
+    for key, whose in (("files", "checkpoint"), ("base_files", "base")):
+        if not _weights(made.get(key)) or _weights(made.get(key)) != _weights(pin.get(key)):
+            problems.append(f"the {whose}'s weights are not the files the main pass scored")
+    if not made.get("prompts") or made.get("prompts") != pin.get("prompts"):
+        problems.append(f"prompts: taken from {made.get('prompts')}, the main pass used {pin.get('prompts')}")
+
+    kept = load_file(tensors_path(out, repo))
+    if lost := [k for k in ANSWER_TENSORS if k not in kept]:
+        return [*problems, f"{', '.join(lost)}: not in the record"]
+    drop, kl, lengths = kept["answer.drop"].double(), kept["answer.kl"].double(), kept["answer.lengths"]
+    problems += [f"{k} in the record is not finite" for k in ANSWER_TENSORS[:2] if not torch.isfinite(kept[k]).all()]
+    if not len(kl) or drop.shape != kl.shape or kl.dim() != 1 or int(lengths.sum()) != len(kl) or int(lengths.min()) < 1:
+        return [*problems, f"the record has {len(drop)} and {len(kl)} numbers for answers of {int(lengths.sum())} tokens"]
+    starts = lengths.cumsum(0) - lengths
+    gives = {"answer_logprob_drop": float(drop.mean()), "answer_kl": float(kl.mean()), "answer_first_kl": float(kl[starts].mean()),
+             "answer_prompts": len(lengths), "answer_tokens": len(kl)}
+    for key, value in gives.items():
+        if not isinstance(row.get(key), (int, float)) or not math.isfinite(row[key]) or not abs(row[key] - value) <= 1e-6 * max(1.0, abs(value)):
+            problems.append(f"{key}: the row says {row.get(key)}, the record gives {value}")
+    answers = _json(out.parent / "prompts" / str(made.get("answers")))
+    if answers is None:
+        problems.append(f"the base's answers the numbers were taken over are not on disk ({made.get('answers')})")
+    elif [len(a) for a in answers.get("answer_tokens") or []] != lengths.tolist() or answers.get("max_new_tokens") != row.get("max_new_tokens"):
+        problems.append(f"the base's answers in {made.get('answers')} are not the ones the numbers were taken over")
+    main = tensors_path(main_out, repo)
+    was = float(load_file(main)["behaviour.kl"].double().mean()) if main.exists() and "behaviour.kl" in load_file(main) else None
+    again = row.get("behaviour_kl_harmful")
+    if was is None:
+        problems.append(f"no first-token KL on harmful prompts for {repo} in the main pass's record")
+    elif not isinstance(again, float) or not abs(again - was) <= max(0.002, 0.01 * abs(was)):
+        problems.append(f"the first-token KL on harmful prompts is {again} here and {was} in the main pass: was it loaded as it was there?")
+    return problems
+
+
 def validate(row: dict, out: str | Path, prompts: list[str], weights: bool = True) -> list[str]:
     """Everything wrong with what was saved for ``row``'s checkpoint; empty means its weights
     are no longer needed. Reads only from disk. Beyond presence and finiteness it checks that
