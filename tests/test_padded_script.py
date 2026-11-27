@@ -268,3 +268,38 @@ def test_with_a_detectors_measurement_of_the_stream_every_row_has_the_weighted_s
         assert r["reader_weighted_shared_n"] == r["reader_shared_n"]
         assert 0.0 <= r["reader_weighted_shared_k8"] <= r["reader_weighted_shared_k128"] + 1e-4 <= 1.0 + 2e-4  # kept in half precision
     assert rows["plain"]["reader_weighted_shared_k8"] == pytest.approx(1.0, abs=1e-3)
+
+
+# ---- how far each variant moves from the base over whole answers
+
+
+def far_rows(s: dict) -> dict[str, dict]:
+    return {r["name"]: r for r in sweep.read_rows(s["rows"].parent / "divergence.jsonl")}
+
+
+def test_every_variant_is_measured_over_the_bases_whole_answers_to_the_harmless_prompts(setup, monkeypatch):
+    rows = run(setup, monkeypatch, "--divergence-tokens", "4")
+    far = far_rows(setup)
+    assert list(far) == ["plain", "shared_k2", "decoys_p3"]
+    for name, r in far.items():
+        assert (r["model"], r["direction"], r["max_new_tokens"]) == (BASE, "found", 4)
+        assert (r["answer_prompts"], r["answer_tokens"]) == (len(PROMPTS) - 2, 4 * (len(PROMPTS) - 2))
+        assert r["answer_kl"] > 0 and "answer_logprob_drop" in r
+        assert r["kl_harmless"] == rows[name]["kl_harmless"] > 0  # the first-token KL of the sweeps, measured in the same pass
+        assert r["answer_first_kl"] == pytest.approx(r["kl_harmless"], rel=1e-3)
+    assert "answer_kl" not in rows["plain"]
+
+
+def test_rows_of_an_earlier_run_are_measured_over_whole_answers_without_being_touched(setup, monkeypatch):
+    rows = run(setup, monkeypatch)
+    before = setup["rows"].read_bytes()
+    assert not (setup["rows"].parent / "divergence.jsonl").exists()
+    assert run(setup, monkeypatch, "--divergence-tokens", "4") == rows and setup["rows"].read_bytes() == before
+    far = far_rows(setup)
+    assert list(far) == list(rows)
+    for name, r in far.items():  # each edit was made again as it was
+        assert r["kl_harmless"] == pytest.approx(rows[name]["kl_harmless"], rel=1e-6) and r["answer_kl"] > 0
+    monkeypatch.setattr(setup["script"], "blind_readers_on_disk", lambda *a, **k: pytest.fail("every variant has its row and its measure"))
+    run(setup, monkeypatch, "--divergence-tokens", "4")
+    assert far_rows(setup) == far
+    assert not setup["scratch"].exists() or not any(setup["scratch"].iterdir())

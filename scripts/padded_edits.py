@@ -49,6 +49,13 @@ the reader_* scores, first-token bypass and KL on harmless prompts as the sweeps
 and the share of answers that open with a refusal phrase. For each further value of --kept
 the shared-direction scores are added as they would be had a record kept that many factors.
 
+With --divergence-tokens t, every variant is also measured against the base over whole
+answers: the base's own greedy answers to the held-out harmless prompts, t tokens of each, are
+fed back to the variant, and <--out>/<direction>/<model>/divergence.jsonl gets a row with how
+far it stands from the base over all their tokens (obliterated.divergence) beside the
+first-token KL of the same pass. A variant whose row an earlier run made is made again for
+this and its row is left as it was.
+
 With --answers n, every variant and the unedited base also answer n JailbreakBench prompts in
 full, and each --judge labels them once the model is dropped (<--out>/judged.jsonl; the
 answers under <--out>/completions/ are model output on harmful prompts and stay local).
@@ -72,7 +79,7 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
-from obliterated import completions, data, direction, record, stream, sweep, unlisted
+from obliterated import completions, data, direction, divergence, record, stream, sweep, unlisted
 from obliterated.edits import EditSpec, blind_readers_on_disk, readers_from
 from obliterated.generate import generate
 from obliterated.judge import Judge
@@ -126,6 +133,8 @@ def main() -> None:
                     help="folder of a detector's measurements of the stream (scripts/weighted_readers.py): the scores weighed by it are added to every row")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--gen-tokens", type=int, default=32, help="tokens generated for the refusal-phrase check")
+    ap.add_argument("--divergence-tokens", type=int, default=0,
+                    help="measure every variant against the base over this many tokens of the base's own answer to each held-out harmless prompt")
     ap.add_argument("--answers", type=int, default=0, help="JailbreakBench prompts to answer in full for the judges")
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--judge", nargs="*", default=[], help="judges for the full answers")
@@ -177,10 +186,12 @@ def main() -> None:
     jobs = {args.model: {"repo": args.model, "base": args.model, "label": "base", "bypass_rate": 0.0}}
     jobs |= {f"{args.model}#{source.name}+{name}": {"repo": f"{args.model}#{source.name}+{name}", "base": args.model, "label": "reader_edit",
                                                     "direction": source.name, "variant": name} for name, *_ in variants}
-    table = out / "padded.jsonl"
+    table, far_table = out / "padded.jsonl", out / "divergence.jsonl"
     done = {r["name"]: r for r in sweep.read_rows(table)} if table.exists() else {}
+    far_done = {r["name"] for r in sweep.read_rows(far_table)} if far_table.exists() else set()
     wanted = [name for name in jobs if args.answers and not completions.path(judged, name).exists()]
-    todo = [v for v in variants if v[0] not in done or f"{args.model}#{source.name}+{v[0]}" in wanted]
+    todo = [v for v in variants if v[0] not in done or f"{args.model}#{source.name}+{v[0]}" in wanted
+            or args.divergence_tokens and v[0] not in far_done]
     span_path = record.span_path(args.span, args.model).resolve()
     (out / "padded.json").write_text(json.dumps({
         "model": args.model, "base_revision": pinned["base_revision"], "base_files": pinned["base_files"], "directions_from": repos[0],
@@ -195,6 +206,7 @@ def main() -> None:
         h_train, s_train, h_val, s_val = data.contrast_sets("arditi", args.n_train, args.n_val)
         h_val, s_val = direction.filter_by_baseline(lm, h_val, s_val, bs)
         ids, base_s = lm.refusal_token_ids, last_logits(lm, s_val, bs)
+        base_far = divergence.base_answers(lm, s_val, args.divergence_tokens, bs) if args.divergence_tokens else None
         prompts = completions.prompts(args.answers) if args.answers else []
         if args.model in wanted:
             completions.record(lm, args.model, prompts, completions.path(judged, args.model), "base", args.max_new_tokens, bs)
@@ -246,6 +258,12 @@ def main() -> None:
                                 "phrase_refusal_rate": refusal_rate(generate(lm, h_val, args.gen_tokens, bs))}
                     if job in wanted:
                         completions.record(lm, job, prompts, completions.path(judged, job), "base", args.max_new_tokens, bs)
+                    if base_far is not None and name not in far_done:
+                        # the first-token KL is measured again here when the row is an earlier run's: it says the edit was made again as it was
+                        first = does["kl_harmless"] if row is None else float(kl_div(base_s, last_logits(lm, s_val, bs)).mean())
+                        sweep.write_rows([{"name": name, "model": args.model, "direction": source.name, "max_new_tokens": args.divergence_tokens,
+                                           "kl_harmless": first, **divergence.measure(lm, base_far, bs)}], far_table)
+                        far_done.add(name)
             finally:
                 shutil.rmtree(edit, ignore_errors=True)
             if row is None:
