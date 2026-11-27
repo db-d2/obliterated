@@ -38,18 +38,34 @@ class Answers:
 
 @torch.no_grad()
 def greedy(lm: LM, instructions: list[str], max_new_tokens: int = 64, batch_size: int = 16) -> list[list[int]]:
-    """The token ids of the model's greedy answer to each instruction. An answer that ends
-    within ``max_new_tokens`` keeps the token that ends it, since stopping there is part of
-    the answer, and nothing after it."""
+    """The token ids of the model's greedy answer to each instruction: its likeliest next
+    token, one at a time. An answer that ends within ``max_new_tokens`` keeps the token that
+    ends it, since stopping there is part of the answer, and nothing after it.
+
+    The loop is written out and ``generate`` is not used: that applies whatever decoding
+    settings the model ships with even when it does not sample (Qwen 2.5 ships a repetition
+    penalty), and the answers would then hold tokens that were not the model's likeliest.
+    Only the tokens that end an answer are taken from those settings."""
     ends = lm.model.generation_config.eos_token_id
     ends = set() if ends is None else {ends} if isinstance(ends, int) else set(ends)
     out = []
     for i in range(0, len(instructions), batch_size):
         enc = lm.tokenize(instructions[i : i + batch_size])
-        ids = lm.model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=lm.tokenizer.pad_token_id)
-        for row in ids[:, enc["input_ids"].shape[1] :].tolist():
-            stop = next((t for t, token in enumerate(row) if token in ends), len(row) - 1)
-            out.append(row[: stop + 1])
+        mask = enc["attention_mask"]
+        rows: list[list[int]] = [[] for _ in mask]
+        going = [True] * len(rows)
+        step = lm.model(input_ids=enc["input_ids"], attention_mask=mask, use_cache=True)
+        for t in range(max_new_tokens):
+            chosen = step.logits[:, -1].argmax(-1)
+            for row, token in zip(range(len(rows)), chosen.tolist()):
+                if going[row]:
+                    rows[row].append(token)
+                    going[row] = token not in ends
+            if not any(going) or t == max_new_tokens - 1:
+                break
+            mask = torch.cat([mask, mask.new_ones(len(rows), 1)], dim=1)
+            step = lm.model(input_ids=chosen[:, None], attention_mask=mask, past_key_values=step.past_key_values, use_cache=True)
+        out += rows
     return out
 
 

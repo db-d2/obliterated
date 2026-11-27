@@ -48,6 +48,18 @@ def test_greedy_answers_are_the_tokens_the_model_picks_one_at_a_time(lm):
             assert token == int(logits_after(lm, prompt, answer[:t]).argmax())
 
 
+def test_greedy_answers_take_the_likeliest_token_whatever_decoding_settings_the_model_ships_with(lm):
+    """Qwen 2.5 ships a repetition penalty, which ``generate`` applies even without sampling:
+    its answers then hold tokens that were not the model's likeliest."""
+    plain = divergence.greedy(lm, PROMPTS, max_new_tokens=8, batch_size=2)
+    lm.model.generation_config.repetition_penalty = 5.0
+    lm.model.generation_config.no_repeat_ngram_size = 1
+    assert divergence.greedy(lm, PROMPTS, max_new_tokens=8, batch_size=2) == plain
+    for prompt, answer in zip(PROMPTS, plain):
+        for t, token in enumerate(answer):
+            assert token == int(logits_after(lm, prompt, answer[:t]).argmax())
+
+
 def test_a_greedy_answer_ends_with_the_token_that_ends_it(lm):
     unbounded = divergence.greedy(lm, PROMPTS[:2], max_new_tokens=5)
     stop = unbounded[0][1]
