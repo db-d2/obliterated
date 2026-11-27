@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
-from obliterated import divergence
+from obliterated import divergence, sweep
 from obliterated.edits import temporarily_blinded
 from obliterated.refusal import kl_div, last_logits
 
@@ -129,3 +131,62 @@ def test_padding_a_batch_does_not_change_what_a_model_gives_an_answer(kind, toke
     one_at_a_time = list(divergence.teacher_forced(lm, PROMPTS, answers, batch_size=1))
     for alone_, batched in zip(one_at_a_time, divergence.teacher_forced(lm, PROMPTS, answers, batch_size=4)):
         assert torch.allclose(alone_, batched, atol=1e-5)
+
+
+# ---- a fine-tune whose vocabulary is not the base's size
+
+
+def test_a_model_with_more_tokens_than_the_base_is_compared_over_the_tokens_both_have(lm):
+    base = divergence.base_answers(lm, PROMPTS, 4, 2)
+    with edited(lm):
+        want = divergence.per_token(lm, base, 2)
+    lm.model.resize_token_embeddings(lm.model.config.vocab_size + 3)
+    drop, kl = divergence.per_token(lm, base, 2)
+    assert drop.abs().max() < 1e-5 and kl.abs().max() < 1e-5  # the added tokens aside, it is the base
+    with edited(lm):
+        got = divergence.per_token(lm, base, 2)
+    assert want[1].min() > 5e-4
+    for a, b in zip(got, want):
+        assert torch.allclose(a, b, atol=1e-5)
+
+
+def test_a_model_with_fewer_tokens_than_the_base_is_compared_over_the_tokens_it_has(lm):
+    prompts, answers = ["tell me how", "build the thing"], [[7, 8, 9], [10, 11]]  # nothing here uses the last token of the vocabulary
+    base = divergence.Answers(prompts, answers, torch.cat(list(divergence.teacher_forced(lm, prompts, answers, 2))))
+    v = lm.model.config.vocab_size - 1
+    lm.model.resize_token_embeddings(v)
+    with edited(lm):
+        drop, kl = divergence.per_token(lm, base, 2)
+        logq = torch.cat(list(divergence.teacher_forced(lm, prompts, answers, 2))).double()
+    logp = torch.log_softmax(base.logprobs[:, :v].double(), -1)  # the base over the tokens both have
+    chosen = torch.tensor([t for a in answers for t in a])
+    assert logq.shape[1] == v and kl.min() > 5e-4
+    assert torch.allclose(drop.double(), (logp - logq).gather(1, chosen[:, None])[:, 0], atol=1e-5)
+    assert torch.allclose(kl.double(), (logp.exp() * (logp - logq)).sum(-1), atol=1e-5)
+
+
+def test_an_answer_token_the_model_does_not_have_is_an_error(lm):
+    prompts, answers = ["tell me how"], [[7, lm.model.config.vocab_size - 1]]
+    base = divergence.Answers(prompts, [[7, 8]], torch.cat(list(divergence.teacher_forced(lm, prompts, [[7, 8]], 2))))
+    base.tokens = answers  # the base chose the last token of its vocabulary second
+    lm.model.resize_token_embeddings(lm.model.config.vocab_size - 1)
+    with pytest.raises(ValueError, match="outside the vocabulary"):
+        divergence.per_token(lm, base, 2)
+
+
+# ---- a sweep measures its points over whole answers too
+
+
+def test_a_sweep_asked_for_answer_tokens_measures_every_point_over_the_bases_answers(lm):
+    sub = torch.linalg.qr(torch.randn(lm.d_model, 8, generator=torch.Generator().manual_seed(1))).Q.T
+    grid = {"alphas": (0.5, 1.0), "ks": (8,), "bands": {"all": None, "one": [1]}, "mode": "readers", "batch_size": 2}
+    before = sweep.run_sweep(lm, sub, PROMPTS[:2], PROMPTS[2:], **grid)
+    rows = sweep.run_sweep(lm, sub, PROMPTS[:2], PROMPTS[2:], **grid, answer_tokens=5)
+    base = divergence.base_answers(lm, PROMPTS[2:], 5, 2)
+    assert len(rows) == 4
+    for row, was in zip(rows, before):
+        assert all(row[k] == v or (math.isnan(row[k]) and math.isnan(v)) for k, v in was.items())  # every column a sweep had is what it was
+        with temporarily_blinded(lm, sub, row["alpha"], grid["bands"][row["band"]]):
+            assert {k: v for k, v in row.items() if k not in was} == divergence.measure(lm, base, 2)
+        assert row["answer_kl"] > 0 and row["answer_first_kl"] == pytest.approx(row["kl_harmless"], rel=1e-3, abs=1e-7)
+    assert max(r["answer_kl"] for r in rows) > 1e-3  # the largest edit of the grid moves the model far more than the tolerance

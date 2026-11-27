@@ -8,6 +8,12 @@ Writes runs/<model>/frontier.jsonl (one row per attack point, appended across in
 and runs/<model>/frontier.png. If --edit is omitted the source layer is chosen by the Arditi
 procedure on the training split first. Pass --negatives runs/detect/benign.jsonl (from
 scripts/detect_checkpoints.py) to draw detector thresholds at 5% false-positive rate.
+
+With --divergence-tokens t, every point is also measured against the unedited model over whole
+answers: the model's own greedy answers to the held-out harmless prompts, t tokens of each, are
+fed back to it under the edit, and the row gets the answer_* columns of obliterated.divergence
+beside the first-token KL. Give a sweep that is run again for this an --out of its own: rows
+are appended, and a second row for a point is not told apart from the first.
 """
 
 from __future__ import annotations
@@ -42,6 +48,8 @@ def main() -> None:
     ap.add_argument("--n-val", type=int, default=64)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--negatives", default=None, help="JSONL of detector rows for benign fine-tunes")
+    ap.add_argument("--divergence-tokens", type=int, default=0,
+                    help="also measure every point against the unedited model over this many tokens of its own answer to each held-out harmless prompt")
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default="runs")
     args = ap.parse_args()
@@ -77,7 +85,7 @@ def main() -> None:
     ref_dirs = detect.reference_directions(lm, h_tr, s_tr, pos, bs)
     rows = sweep.run_sweep(
         lm, sub, h_val, s_val, parse_list(args.alphas, float), ks, bands, args.mode, ref_dirs, batch_size=bs,
-        tag=f"{args.method}",
+        tag=f"{args.method}", answer_tokens=args.divergence_tokens,
     )
     sweep.write_rows(rows, out / "frontier.jsonl")
 

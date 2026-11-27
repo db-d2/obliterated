@@ -26,7 +26,7 @@ from pathlib import Path
 import torch
 from tqdm.auto import tqdm
 
-from . import detect, hooks
+from . import detect, divergence, hooks
 from .edits import EditSpec, temporarily_blinded, temporarily_orthogonalized
 from .models import LM
 from .refusal import kl_div, last_logits, refusal_score_from_logits
@@ -76,13 +76,18 @@ def run_sweep(
     detect_layers: list[int] | None = None,
     batch_size: int = 16,
     tag: str = "",
+    answer_tokens: int = 0,
 ) -> list[dict]:
     """One row per (alpha, k, band). ``subspace`` is (K, d) with orthonormal rows, first row the
     difference-in-means direction; ``ks`` must not exceed K. ``mode`` is "hooks" (runtime
     ablation), "weights" (the writer matrices are orthogonalized) or "readers" (the writers are
     left alone and the matrices that read the stream are changed). ``ref_directions`` are the clean
     model's per-layer unit refusal directions (``detect.reference_directions``); computed here
-    from the validation prompts if omitted."""
+    from the validation prompts if omitted.
+
+    With ``answer_tokens``, every point is also measured against the unedited model over that
+    many tokens of its own greedy answer to each harmless prompt (``divergence.measure``): the
+    ``answer_*`` columns, of which ``answer_first_kl`` is ``kl_harmless`` taken that way."""
     if mode not in ("hooks", "weights", "readers"):
         raise ValueError(f"mode must be 'hooks', 'weights' or 'readers', not {mode!r}")
     edit = {"hooks": hooks.ablate, "weights": temporarily_orthogonalized, "readers": temporarily_blinded}[mode]
@@ -95,6 +100,7 @@ def run_sweep(
     base_h_logits = last_logits(lm, harmful_val, batch_size)
     base_s_logits = last_logits(lm, harmless_val, batch_size)
     base_h = refusal_score_from_logits(base_h_logits, ids)
+    base_answers = divergence.base_answers(lm, harmless_val, answer_tokens, batch_size) if answer_tokens else None
     sep_ref = detect.separation(lm, ref_directions, harmful_val, harmless_val, batch_size=batch_size)
 
     rows = []
@@ -110,6 +116,7 @@ def run_sweep(
             h_logits = last_logits(lm, harmful_val, batch_size)
             s_logits = last_logits(lm, harmless_val, batch_size)
             sep = detect.separation(lm, ref_directions, harmful_val, harmless_val, batch_size=batch_size)
+            far = divergence.measure(lm, base_answers, batch_size) if base_answers is not None else {}
         h = refusal_score_from_logits(h_logits, ids)
         weights = detect.weight_scores(
             detect.diff_pairs_from_edit(lm, spec, range(lm.n_layers), factored=True), detect_layers
@@ -135,6 +142,7 @@ def run_sweep(
                 "activation_gap": detect.activation_gap(sep_ref, sep, detect_layers),
                 "behaviour_kl_harmful": shift["kl_harmful"],
                 "behaviour_refusal_drop": shift["refusal_score_drop"],
+                **far,
             }
         )
     return rows

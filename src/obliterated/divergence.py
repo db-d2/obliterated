@@ -92,11 +92,21 @@ def per_token(lm: LM, base: Answers, batch_size: int = 16) -> tuple[torch.Tensor
 
     ``lm`` is run on the base's answers and not on its own, so both models are compared on the
     same text. The comparison is made answer by answer and only the base's distributions are
-    held in memory."""
+    held in memory.
+
+    A fine-tune whose vocabulary is longer or shorter than the base's is compared over the
+    tokens both have, each side's distribution brought to sum to 1 over them, as
+    ``detect.behaviour_per_prompt`` does at the first token. The tokens of the base's answers
+    have to be among them."""
     chosen = torch.tensor([token for answer in base.tokens for token in answer])
+    if int(chosen.max()) >= lm.embed.num_embeddings:
+        raise ValueError(f"the base's answers use token {int(chosen.max())}, outside the vocabulary of {lm.embed.num_embeddings} tokens this model has")
     drops, kls, at = [], [], 0
     for logq in teacher_forced(lm, base.instructions, base.tokens, batch_size):
         logp, logq = base.logprobs[at : at + len(logq)].double(), logq.double()
+        if logq.shape[-1] != logp.shape[-1]:
+            shared = min(logp.shape[-1], logq.shape[-1])
+            logp, logq = torch.log_softmax(logp[:, :shared], -1), torch.log_softmax(logq[:, :shared], -1)
         drops.append((logp - logq).gather(1, chosen[at : at + len(logq), None])[:, 0])
         kls.append((logp.exp() * (logp - logq)).sum(-1))
         at += len(logq)
