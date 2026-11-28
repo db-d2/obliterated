@@ -1,4 +1,5 @@
 import json
+import warnings
 
 import pytest
 import torch
@@ -79,6 +80,96 @@ def test_gemma2_weight_edit_warns(tokenizer):
     lm = make_lm("gemma2", tokenizer)
     with pytest.warns(UserWarning, match="approximate"):
         orthogonalize(lm, rand_dir(lm))
+
+
+# ---- Gemma's output norms: a writer-side edit corrected for their gains
+
+
+def uneven_output_gains(lm, seed=5):
+    """Output norms as a trained Gemma has them: a gain of its own on every coordinate."""
+    g = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for i in range(lm.n_layers):
+            for norm in lm.write_modules(i):
+                norm.weight.copy_(torch.rand(lm.d_model, generator=g) * 3 - 0.5)  # Gemma stores the gain less 1
+
+
+def left_in_stream(lm, rows):
+    """The largest component of the residual stream along any of ``rows``, over every layer's input."""
+    store = []
+    with hooks.cache_residual(lm, 3, store):
+        lm.model(**lm.tokenize(PROMPTS))
+    return max(float((acts[0] @ rows.T).abs().max()) for acts in store)
+
+
+@pytest.mark.parametrize("k", [1, 2])
+@pytest.mark.parametrize("how", ["project", "divide"])
+def test_gain_corrected_edit_leaves_nothing_of_the_direction_in_the_stream(how, k, tokenizer):
+    plain, lm = make_lm("gemma2", tokenizer), make_lm("gemma2", tokenizer)
+    uneven_output_gains(plain)
+    uneven_output_gains(lm)
+    d = rand_dir(lm) if k == 1 else torch.stack([rand_dir(lm, 1), rand_dir(lm, 2)])
+    rows = hooks.orthonormal(d)
+    with pytest.warns(UserWarning, match="approximate"):
+        orthogonalize(plain, d)
+    assert left_in_stream(plain, rows) > 1e-2  # what the warning is about
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # corrected, the edit is not approximate and says nothing
+        orthogonalize(lm, d, gains=how)
+    assert left_in_stream(lm, rows) < 1e-4
+
+
+def test_the_two_gain_corrections_differ_in_what_they_leave(tokenizer):
+    """'divide' takes the direction out of what the norm hands on and leaves the rest of it as
+    it was; 'project' is the smaller change to the matrix and moves the rest as well."""
+    made = {}
+    for how in ("project", "divide"):
+        lm = make_lm("gemma2", tokenizer)
+        uneven_output_gains(lm)
+        d = rand_dir(lm)
+        r = d / d.norm()
+        lin, norm = lm.write_params(1)[1], lm.write_modules(1)[1]
+        g = norm_gain(norm, lm.d_model)
+        before = lin.weight.detach().clone()
+        orthogonalize(lm, d, gains=how, edit_embeddings=False)
+        h = torch.randn(lin.in_features, generator=torch.Generator().manual_seed(2))
+        was, now = g * (before @ h), g * (lin.weight.detach() @ h)  # what the norm hands on, before it sets the length
+        assert (now @ r).abs() < 1e-4 * now.norm()
+        made[how] = was, now, (lin.weight.detach() - before).norm()
+    was, now, _ = made["divide"]
+    torch.testing.assert_close(now, was - (was @ r) * r, atol=1e-4, rtol=1e-4)
+    was, now, _ = made["project"]
+    assert not torch.allclose(now, was - (was @ r) * r, atol=1e-3, rtol=1e-3)
+    assert made["project"][2] < made["divide"][2]
+
+
+def test_gain_floor_leaves_rows_behind_a_near_zero_gain_alone(tokenizer):
+    def edited(floor):
+        lm = make_lm("gemma2", tokenizer)
+        uneven_output_gains(lm)
+        lin, norm = lm.write_params(0)[0], lm.write_modules(0)[0]
+        with torch.no_grad():
+            norm.weight[3] = -1 + 1e-4  # a gain of 1e-4: a row the stream hears almost nothing from
+        before = lin.weight.detach().clone()
+        orthogonalize(lm, rand_dir(lm), gains="divide", gain_floor=floor, edit_embeddings=False)
+        return before, lin.weight.detach()
+
+    before, after = edited(0.0)
+    assert int((after - before).norm(dim=1).argmax()) == 3  # dividing by its gain makes that row's change the largest
+    before, after = edited(0.1)
+    assert torch.equal(after[3], before[3])
+    assert not torch.equal(after[4], before[4])
+
+
+def test_gain_correction_is_refused_where_it_means_nothing(tokenizer):
+    with pytest.raises(ValueError, match="output norms"):
+        lm = make_lm("llama_untied", tokenizer)
+        orthogonalize(lm, rand_dir(lm), gains="project")
+    lm = make_lm("gemma2", tokenizer)
+    with pytest.raises(ValueError, match="project.*divide"):
+        orthogonalize(lm, rand_dir(lm), gains="scale")
+    with pytest.raises(ValueError, match="gain_floor"):
+        orthogonalize(lm, rand_dir(lm), gains="project", gain_floor=0.1)
 
 
 def test_moe_writers_include_every_expert(tokenizer):

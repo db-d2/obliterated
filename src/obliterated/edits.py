@@ -46,6 +46,25 @@ def _orth_embedding(weight: torch.Tensor, basis: torch.Tensor, alpha: float) -> 
     weight.data.copy_(w.to(weight.dtype))
 
 
+@torch.no_grad()
+def _orth_behind_gain(lin: nn.Linear, basis: torch.Tensor, alpha: float, gain: torch.Tensor, how: str, floor: float) -> None:
+    """In place, for a Linear whose output x reaches the stream as gain * x / rms(x): take
+    ``alpha`` of the orthonormal rows of ``basis`` out of what arrives. W <- W - alpha * G^T T W,
+    where T is what is read off x and G is what is given back for it (see ``orthogonalize``)."""
+    b = basis.to(lin.weight.device, torch.float32)
+    g = gain.to(lin.weight.device, torch.float32)
+    if how == "project":
+        take = give = hooks.orthonormal(b * g).to(b.device)
+    else:
+        heard = (g.abs() >= floor * g.abs().median()) & (g != 0)
+        take, give = b * g, torch.where(heard, b / torch.where(heard, g, torch.ones_like(g)), torch.zeros_like(b))
+    for p in (lin.weight, lin.bias):
+        if p is not None:
+            v = p.data.float()
+            v -= alpha * give.T @ (take @ v)
+            p.data.copy_(v.to(p.dtype))
+
+
 def untie_lm_head(lm: LM) -> None:
     """Small Llama 3.2 and Qwen 2.5 models tie lm_head to the input embedding. Editing the
     embedding would then also edit the unembedding, which ablation hooks never touch."""
@@ -65,6 +84,8 @@ def orthogonalize(
     alpha: float = 1.0,
     layers: list[int] | None = None,
     edit_embeddings: bool = True,
+    gains: str | None = None,
+    gain_floor: float = 0.0,
 ) -> None:
     """Bake directional ablation into the weights, in place.
 
@@ -72,8 +93,26 @@ def orthogonalize(
     expert down projections), plus the token embedding, has ``alpha`` of its component along
     ``direction`` removed. ``direction`` may be one vector or a (k, d) stack; each matrix then
     changes by a rank-k update.
+
+    Gemma 2 and 3 pass what a sublayer writes through a norm with a gain per coordinate before
+    it reaches the stream, y = g * x / rms(x), so a direction taken out of x is not out of y.
+    ``gains`` corrects the edit for that, in one of two ways. Either leaves nothing of
+    ``direction`` in what is written:
+
+    - ``"project"``: what is taken out of x is g * direction. This is the smallest change to
+      the matrix that does it; the rest of y moves a little as well.
+    - ``"divide"``: ``direction`` is taken out of g * x and the rest of g * x is left as it
+      was. Row i of the matrix then changes in proportion to direction_i / g_i, which is
+      large where a gain is near zero. With ``gain_floor`` f, the rows behind a gain under f
+      times the norm's median gain are left alone: the stream hears least of those.
     """
-    if lm.has_post_norms:
+    if gains not in (None, "project", "divide"):
+        raise ValueError(f"gains is 'project' or 'divide', not {gains!r}")
+    if gains and not lm.has_post_norms:
+        raise ValueError("gains: this model has no output norms to correct for")
+    if gain_floor and gains != "divide":
+        raise ValueError("gain_floor goes with gains='divide'")
+    if lm.has_post_norms and not gains:
         warnings.warn(
             "This model normalizes sublayer outputs before the residual add (Gemma 2/3). "
             "Orthogonalizing o_proj/down_proj is then only approximate; use hooks.ablate for an "
@@ -85,6 +124,10 @@ def orthogonalize(
         untie_lm_head(lm)
         _orth_embedding(lm.embed.weight, basis, alpha)
     for i in range(lm.n_layers) if layers is None else layers:
+        if gains:
+            for lin, norm in zip(lm.write_params(i), lm.write_modules(i), strict=True):
+                _orth_behind_gain(lin, basis, alpha, norm_gain(norm, lm.d_model), gains, gain_floor)
+            continue
         for w in lm.write_params(i):
             if isinstance(w, nn.Parameter):
                 _orth_rows_out(w, basis, alpha)
