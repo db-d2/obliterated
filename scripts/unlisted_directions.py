@@ -129,12 +129,21 @@ def main() -> None:
             starts.append(("random_outside_0", None))  # the free search
         for objective, (begin, avoid) in [(o, s) for o in objectives for s in starts]:
             started = time.time()
+            name = f"searched_{objective}_" + (f"from_{begin}" if avoid is not None else "free")
+            state = out / f"{name}.search.pt"  # a search that was stopped goes on from here
+            if state.exists():
+                print(f"search {name}: going on from {state.name}", flush=True)
+
+            def told(done: int, step: dict, name: str = name, started: float = started) -> None:
+                if done == 1 or done % 10 == 0 or done == args.steps:
+                    held = f", the GPU holds {torch.mps.driver_allocated_memory() / 2**30:.1f} GB" if lm.device.type == "mps" else ""
+                    print(f"   search {name}: step {done} of {args.steps}, loss {step['loss']:.3f}{held}; {time.time() - started:.0f}s", flush=True)
+
             v, history = unlisted.find_direction(lm, harmful, harmless, by_name[begin]["direction"], avoid,
                                                  like if objective == "answers" else None, args.tokens,
-                                                 args.steps, args.lr, args.kl_weight, bs, args.seed)
+                                                 args.steps, args.lr, args.kl_weight, bs, args.seed, state=state, each_step=told)
             tail = history[-10:]
             ends = {k: sum(h[k] for h in tail) / len(tail) for k in ("loss", "harmful", "kl")}
-            name = f"searched_{objective}_" + (f"from_{begin}" if avoid is not None else "free")
             found.append({"name": name, "kind": "searched", "direction": v, **unlisted.describe(v, span), "start": begin,
                           "objective": objective, "avoids": "the span and its controls" if avoid is not None else "nothing",
                           "began": history[0], "ended": ends, "history": [round(h["loss"], 4) for h in history]})
@@ -151,6 +160,8 @@ def main() -> None:
             "made_at": datetime.now(UTC).isoformat(timespec="seconds"), "versions": versions,
             "directions": [{k: v for k, v in c.items() if k != "direction"} for c in found],
         }, indent=1))
+        for state in out.glob("*.search.pt"):  # the directions are kept: the searches need not be gone on with
+            state.unlink()
         # what was measured of the directions these replace is kept, out of the way
         aside = out / f"before_{datetime.now(UTC):%Y%m%dT%H%M%S}"
         for stale in [out / "scan.jsonl", *(Path(args.out) / "sweeps").glob(f"*/{slug}")]:

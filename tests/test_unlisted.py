@@ -144,6 +144,72 @@ def test_a_search_repeats_for_a_seed(tokenizer):
     assert not torch.allclose(run(0), run(1), atol=1e-4)
 
 
+# ---- a search that is stopped part of the way
+
+
+def a_search(tokenizer, **how):
+    """A short search with every setting spelled out, so that a test can change one of them."""
+    lm, avoid, _, _ = searchable(tokenizer)
+    how = {"start": rand_dir(lm, 4), "steps": 6, "lr": 0.02, "kl_weight": 1.0, "batch_size": 2, "seed": 0, "harmful": PROMPTS} | how
+    return unlisted.find_direction(lm, how.pop("harmful"), PROMPTS, how.pop("start"), avoid, **how)
+
+
+def test_a_search_tells_of_each_step_as_it_ends(tokenizer):
+    told = []
+    _, history = a_search(tokenizer, each_step=lambda done, step: told.append((done, step)))
+    assert told == list(enumerate(history, 1))
+
+
+def test_a_stopped_search_picks_up_where_it_left_off(tokenizer, tmp_path):
+    whole, steps = a_search(tokenizer)
+
+    def stop_after_three(done, step):
+        if done == 3:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        a_search(tokenizer, state=tmp_path / "search.pt", each_step=stop_after_three)
+    ran = []
+    found, history = a_search(tokenizer, state=tmp_path / "search.pt", each_step=lambda done, step: ran.append(done))
+    assert ran == [4, 5, 6]  # the three steps it had made were not made again
+    assert torch.equal(found, whole) and history == steps  # and it ends where a search left alone ends
+
+
+def test_a_finished_search_given_its_state_makes_no_more_steps(tokenizer, tmp_path):
+    whole, steps = a_search(tokenizer, state=tmp_path / "search.pt")
+    ran = []
+    found, history = a_search(tokenizer, state=tmp_path / "search.pt", each_step=lambda done, step: ran.append(done))
+    assert ran == [] and torch.equal(found, whole) and history == steps
+
+
+@pytest.mark.parametrize("other", [{"seed": 1}, {"lr": 0.01}, {"kl_weight": 0.5}, {"batch_size": 1}, {"start": 5}, {"harmful": PROMPTS[:3]}])
+def test_a_search_does_not_pick_up_the_state_of_another_search(tokenizer, tmp_path, other):
+    a_search(tokenizer, steps=2, state=tmp_path / "search.pt")
+    if "start" in other:
+        other = {"start": rand_dir(searchable(tokenizer)[0], other["start"])}
+    with pytest.raises(ValueError, match="another search"):
+        a_search(tokenizer, steps=2, state=tmp_path / "search.pt", **other)
+
+
+def test_a_search_does_not_pick_up_a_state_that_is_further_along_than_it_was_asked_to_go(tokenizer, tmp_path):
+    a_search(tokenizer, steps=3, state=tmp_path / "search.pt")
+    with pytest.raises(ValueError, match="more steps"):
+        a_search(tokenizer, steps=2, state=tmp_path / "search.pt")
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs the Mac's GPU")
+def test_a_stopped_search_picks_up_on_the_macs_gpu(tokenizer, tmp_path):
+    lm, avoid, harmful, harmless = searchable(tokenizer)
+    lm.model.to("mps")
+    run = lambda steps, **more: unlisted.find_direction(lm, harmful, harmless, rand_dir(lm, 4), avoid, steps=steps, lr=0.02, batch_size=2, **more)
+    whole, _ = run(4)
+    run(2, state=tmp_path / "search.pt")
+    ran = []
+    found, history = run(4, state=tmp_path / "search.pt", each_step=lambda done, step: ran.append(done))
+    assert ran == [3, 4] and len(history) == 4
+    assert torch.allclose(found, whole, atol=1e-5)
+
+
 # ---- searching for a direction whose edit answers as a known one does
 
 

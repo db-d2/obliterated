@@ -18,6 +18,12 @@ module: ``scripts/unlisted_directions.py`` measures it.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+from collections.abc import Callable
+from pathlib import Path
+
 import torch
 
 from .edits import blinded
@@ -128,10 +134,32 @@ def answers_under(lm: LM, direction: Tensor, instructions: list[str], tokens: in
     return ids, until_end(ids, end)
 
 
+def _search_mark(lm: LM, harmful: list[str], harmless: list[str], start: Tensor, avoid: Tensor | None, like: Tensor | None,
+                 tokens: int, lr: float, kl_weight: float, batch_size: int, seed: int) -> str:
+    """What tells one search's saved state from another's: everything that decides its steps
+    but how many of them there are."""
+    h = hashlib.sha256()
+    for t in (start, avoid, like):
+        h.update(b"none" if t is None else repr(tuple(t.shape)).encode() + t.detach().cpu().float().contiguous().numpy().tobytes())
+    h.update(json.dumps([lm.name, harmful, harmless, tokens, lr, kl_weight, batch_size, seed]).encode())
+    return h.hexdigest()
+
+
+def _keep_state(path: str | Path, what: dict) -> None:
+    """Written beside the file and then moved over it, so that a stop in the middle of a write
+    leaves the last whole state in place."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    part = path.with_name(path.name + ".part")
+    torch.save(what, part)
+    os.replace(part, path)
+
+
 def find_direction(
     lm: LM, harmful: list[str], harmless: list[str], start: Tensor, avoid: Tensor | None = None,
     like: Tensor | None = None, tokens: int = 16,
     steps: int = 200, lr: float = 0.01, kl_weight: float = 1.0, batch_size: int = 16, seed: int = 0,
+    state: str | Path | None = None, each_step: Callable[[int, dict], None] | None = None,
 ) -> tuple[Tensor, list[dict]]:
     """Search for a unit direction whose reader-side edit (every layer, full strength) stops
     refusal, from ``start``, never leaving the directions orthogonal to the orthonormal rows
@@ -151,11 +179,27 @@ def find_direction(
     The edit is ``edits.blinded``, the weight edit as hooks; the model is not changed. Load it
     in float32: half precision loses the gradient.
 
+    A long search can be stopped. With ``state``, a file, the search is saved there after every
+    step (the direction, the optimizer and the generator that draws the batches), and a search
+    that finds the file goes on from it and ends where one left alone would have. The file of
+    a search with other prompts, directions or settings is refused, and so is one that has
+    made more steps than were asked for. ``each_step`` is called after every step, once that
+    step is saved, with the number of steps made and the step's entry in the history.
+
     Returns the direction (float32, on the CPU) and one dict per step with ``loss`` and its
     two parts, ``harmful`` and ``kl``. What a search finds is fitted to its loss: measure it
     by something the loss did not see."""
     dev = lm.device
     rows = None if avoid is None else avoid.to(dev, torch.float32)
+    mark = saved = None
+    if state is not None:  # before anything costly: a file that cannot be used should fail at once
+        mark = _search_mark(lm, harmful, harmless, start, avoid, like, tokens, lr, kl_weight, batch_size, seed)
+        if Path(state).exists():
+            saved = torch.load(state, map_location="cpu", weights_only=True)
+            if saved["search"] != mark:
+                raise ValueError(f"{state} is the state of another search: other prompts, directions or settings")
+            if len(saved["history"]) > steps:
+                raise ValueError(f"{state} has made more steps ({len(saved['history'])}) than this search is asked for ({steps})")
 
     def unit(w: Tensor) -> Tensor:
         if rows is not None:
@@ -171,10 +215,16 @@ def find_direction(
     g = torch.Generator().manual_seed(seed)
     trained = [p for p in lm.model.parameters() if p.requires_grad]
     history = []
+    if saved is not None:
+        with torch.no_grad():
+            w.copy_(saved["w"])
+        opt.load_state_dict(saved["opt"])
+        g.set_state(saved["generator"])
+        history = saved["history"]
     for p in trained:  # only the direction is being fitted
         p.requires_grad_(False)
     try:
-        for _ in range(steps):
+        for _ in range(len(history), steps):
             hi = torch.randperm(len(harmful), generator=g)[:batch_size].tolist()
             si = torch.randperm(len(harmless), generator=g)[:batch_size].tolist()
             with blinded(lm, unit(w)):
@@ -196,6 +246,10 @@ def find_direction(
             loss.backward()
             opt.step()
             history.append({"loss": loss.item(), "harmful": on_harmful.item(), "kl": kl.item()})
+            if state is not None:
+                _keep_state(state, {"search": mark, "w": w.detach().cpu(), "opt": opt.state_dict(), "generator": g.get_state(), "history": history})
+            if each_step is not None:
+                each_step(len(history), history[-1])
     finally:
         for p in trained:
             p.requires_grad_(True)
