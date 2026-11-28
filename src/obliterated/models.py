@@ -8,6 +8,7 @@ DeepSeek-V3-style MoE such as Moonlight (every expert's ``down_proj`` is a resid
 
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass, field
 
 import torch
@@ -17,6 +18,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, P
 from .device import best_device, default_dtype
 
 _PLACEHOLDER = "<<<INSTRUCTION>>>"
+# Llama 3.2's chat template writes the current date into the system header unless it is given
+# one, so the same checkpoint scores differently from one day to the next. This is the date the
+# template itself falls back on and the one Llama 3.1's template always uses. Templates that
+# have no date line ignore it.
+TEMPLATE_DATE = "26 Jul 2024"
 
 
 @dataclass
@@ -81,6 +87,24 @@ class LM:
             raise ValueError(f"no down_proj found in layer {layer}; add support for this architecture")
         return out
 
+    @property
+    def final_norm(self) -> nn.Module:
+        """The norm between the last layer's output and the output head."""
+        return self.model.model.norm
+
+    def read_modules(self, layer: int) -> list[tuple[nn.Module, nn.Linear]]:
+        """Every matrix that reads the residual stream in this layer, each with the norm that
+        stands between it and the stream: the attention query, key and value projections and
+        the MLP's gate and up projections. Mixture-of-experts blocks are not covered."""
+        block = self.layers[layer]
+        mlp_norm = block.pre_feedforward_layernorm if self.has_post_norms else block.post_attention_layernorm
+        found = [(block.input_layernorm, getattr(block.self_attn, n, None)) for n in ("q_proj", "k_proj", "v_proj")]
+        found += [(mlp_norm, getattr(block.mlp, n, None)) for n in ("gate_proj", "up_proj")]
+        if not all(isinstance(lin, nn.Linear) for _, lin in found):
+            raise ValueError(f"layer {layer}: cannot name every matrix that reads the residual stream; "
+                             "add support for this architecture")
+        return found
+
     # ---- prompting ------------------------------------------------------------------------
 
     def format(self, instruction: str) -> str:
@@ -88,7 +112,7 @@ class LM:
         if self.system_prompt is not None:
             msgs.append({"role": "system", "content": self.system_prompt})
         msgs.append({"role": "user", "content": instruction})
-        return self.tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        return self.tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, date_string=TEMPLATE_DATE)
 
     @property
     def eoi_len(self) -> int:
@@ -115,13 +139,33 @@ def load(
     device: str | None = None,
     dtype: torch.dtype | None = None,
     system_prompt: str | None = None,
+    tokenizer: PreTrainedTokenizer | None = None,
     **kwargs,
 ) -> LM:
+    """``tokenizer`` overrides the checkpoint's own tokenizer and chat template. Pass the base
+    model's when auditing a fine-tune, so a changed template or default system prompt does not
+    show up as a change in behaviour.
+
+    The attention kernel is the library's default unless ``attn_implementation`` is passed,
+    whatever the checkpoint's config asks for: a fine-tune saved with flash attention switched
+    on would otherwise fail to load without that CUDA-only package, and a candidate should
+    run on the same kernel as its base."""
     dev = best_device(device)
     dtype = dtype or default_dtype(dev)
-    tok = AutoTokenizer.from_pretrained(name)
+    tok = tokenizer or AutoTokenizer.from_pretrained(name)
+    kwargs.setdefault("attn_implementation", None)
     model = AutoModelForCausalLM.from_pretrained(name, dtype=dtype, **kwargs).to(dev).eval()
     return wrap(model, tok, name=name, system_prompt=system_prompt)
+
+
+def unload(lm: LM) -> None:
+    """Drop the weights and hand the memory back, before the next model is loaded."""
+    del lm.model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 
 def wrap(model: PreTrainedModel, tokenizer: PreTrainedTokenizer, **kwargs) -> LM:

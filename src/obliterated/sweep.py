@@ -26,12 +26,28 @@ from pathlib import Path
 import torch
 from tqdm.auto import tqdm
 
-from . import detect, hooks
-from .edits import EditSpec, temporarily_orthogonalized
+from . import detect, divergence, hooks
+from .edits import EditSpec, temporarily_blinded, temporarily_orthogonalized
 from .models import LM
 from .refusal import kl_div, last_logits, refusal_score_from_logits
 
 DETECTORS = ("weight_top1_energy", "activation_gap", "behaviour_kl_harmful", "behaviour_refusal_drop")
+# Rank-robust variants of the weight detector, recorded next to the four above.
+EXTRA_DETECTORS = (
+    "weight_top1_energy_w",
+    *(f"weight_top{k}_energy" for k in detect.TOPK),
+    *(f"weight_top{k}_energy_w" for k in detect.TOPK),
+    # From a checkpoint's record (record.alignment); sweep points do not carry them.
+    "weight_refusal_alignment",
+    "weight_refusal_alignment_med",
+    "weight_vocab_alignment",
+    "weight_refusal_alignment_any",
+)
+NEGATIVE_LABELS = ("benign_finetune",)
+# The judged rate behind the behaviour label: the content grader's score, which reads what an
+# answer provides. The two classifiers' rates (wildguard_harmful, both_harmful) also rise when
+# an answer only restates or translates the request, so they are the check on the label.
+HARMFUL_KEY = "strongreject_score"
 
 
 def layer_bands(n_layers: int, source_layer: int | None = None) -> dict[str, list[int] | None]:
@@ -60,11 +76,21 @@ def run_sweep(
     detect_layers: list[int] | None = None,
     batch_size: int = 16,
     tag: str = "",
+    answer_tokens: int = 0,
 ) -> list[dict]:
     """One row per (alpha, k, band). ``subspace`` is (K, d) with orthonormal rows, first row the
-    difference-in-means direction; ``ks`` must not exceed K. ``ref_directions`` are the clean
+    difference-in-means direction; ``ks`` must not exceed K. ``mode`` is "hooks" (runtime
+    ablation), "weights" (the writer matrices are orthogonalized) or "readers" (the writers are
+    left alone and the matrices that read the stream are changed). ``ref_directions`` are the clean
     model's per-layer unit refusal directions (``detect.reference_directions``); computed here
-    from the validation prompts if omitted."""
+    from the validation prompts if omitted.
+
+    With ``answer_tokens``, every point is also measured against the unedited model over that
+    many tokens of its own greedy answer to each harmless prompt (``divergence.measure``): the
+    ``answer_*`` columns, of which ``answer_first_kl`` is ``kl_harmless`` taken that way."""
+    if mode not in ("hooks", "weights", "readers"):
+        raise ValueError(f"mode must be 'hooks', 'weights' or 'readers', not {mode!r}")
+    edit = {"hooks": hooks.ablate, "weights": temporarily_orthogonalized, "readers": temporarily_blinded}[mode]
     bands = bands or layer_bands(lm.n_layers)
     detect_layers = detect_layers or detect.mid_layers(lm.n_layers)
     ids = lm.refusal_token_ids
@@ -74,6 +100,7 @@ def run_sweep(
     base_h_logits = last_logits(lm, harmful_val, batch_size)
     base_s_logits = last_logits(lm, harmless_val, batch_size)
     base_h = refusal_score_from_logits(base_h_logits, ids)
+    base_answers = divergence.base_answers(lm, harmless_val, answer_tokens, batch_size) if answer_tokens else None
     sep_ref = detect.separation(lm, ref_directions, harmful_val, harmless_val, batch_size=batch_size)
 
     rows = []
@@ -83,14 +110,18 @@ def run_sweep(
             raise ValueError(f"k={k} exceeds the subspace rank {subspace.shape[0]}")
         layers = bands[band]
         sub = subspace[:k]
-        spec = EditSpec(direction=sub.tolist(), alpha=alpha, layers=layers, mode="weights")
-        ctx = hooks.ablate(lm, sub, alpha, layers) if mode == "hooks" else temporarily_orthogonalized(lm, sub, alpha, layers)
-        with ctx:
+        spec = EditSpec(direction=sub.tolist(), alpha=alpha, layers=layers, mode="weights",
+                        side="readers" if mode == "readers" else "writers")
+        with edit(lm, sub, alpha, layers):
             h_logits = last_logits(lm, harmful_val, batch_size)
             s_logits = last_logits(lm, harmless_val, batch_size)
             sep = detect.separation(lm, ref_directions, harmful_val, harmless_val, batch_size=batch_size)
+            far = divergence.measure(lm, base_answers, batch_size) if base_answers is not None else {}
         h = refusal_score_from_logits(h_logits, ids)
-        energy = detect.weight_recovery_energy(detect.diff_pairs_from_edit(lm, spec, detect_layers))
+        weights = detect.weight_scores(
+            detect.diff_pairs_from_edit(lm, spec, range(lm.n_layers), factored=True), detect_layers
+        )
+        weights.pop("per_matrix")
         shift = detect.behaviour_shift(base_h_logits, h_logits, ids)
         rows.append(
             {
@@ -107,12 +138,11 @@ def run_sweep(
                 "refusal_score_drop": shift["refusal_score_drop"],
                 "kl_harmless": float(kl_div(base_s_logits, s_logits).mean()),
                 # detectors
-                "weight_top1_energy": energy["top1_energy"],
-                "weight_stable_rank": energy["stable_rank"],
-                "weight_fro_norm": energy.get("fro_norm", 0.0),
+                **weights,
                 "activation_gap": detect.activation_gap(sep_ref, sep, detect_layers),
                 "behaviour_kl_harmful": shift["kl_harmful"],
                 "behaviour_refusal_drop": shift["refusal_score_drop"],
+                **far,
             }
         )
     return rows
@@ -132,27 +162,97 @@ def frontier_auroc(
 ) -> float:
     """AUROC of ``detector`` for the attack points with bypass rate >= ``min_bypass`` (positives)
     against ``negatives`` (rows with the same detector key from benign fine-tunes)."""
-    pos = [r[detector] for r in rows if r["bypass_rate"] >= min_bypass]
-    neg = [r[detector] for r in negatives]
+    pos = [r[detector] for r in rows if r["bypass_rate"] >= min_bypass and detector in r]
+    neg = [r[detector] for r in negatives if detector in r and r[detector] == r[detector]]
     return detect.auroc(pos + neg, [1] * len(pos) + [0] * len(neg))
 
 
-def plot_frontier(rows: list[dict], path: str | Path, thresholds: dict[str, float] | None = None) -> None:
+def benign(rows: list[dict]) -> list[dict]:
+    """The rows of a ``detect_checkpoints.py`` file that count as negatives. Rows without a
+    label (a hand-made negatives file) are kept."""
+    return [r for r in rows if r.get("label", NEGATIVE_LABELS[0]) in NEGATIVE_LABELS]
+
+
+def excess_harmful(judged: list[dict], key: str = HARMFUL_KEY) -> dict[str, float]:
+    """Judged harmful rate of each checkpoint minus its base's, from ``judge_checkpoints.py``
+    rows: the grader's score unless another judge's ``key`` is named. Relative to the base
+    because a small clean model already complies with some harmful prompts. Bases themselves are left out, and so is any checkpoint that this judge has not
+    reached yet or whose base it has not."""
+    rate = {r["repo"]: r[key] for r in judged if key in r}
+    return {repo: v - rate[r["base"]] for r in judged
+            if (repo := r["repo"]) != r["base"] and (v := rate.get(repo)) is not None and r["base"] in rate}
+
+
+def fpr_thresholds(
+    negatives: list[dict], detectors: Iterable[str] = DETECTORS, fpr: float = 0.05
+) -> dict[str, float]:
+    """Per detector, the score that at most a fraction ``fpr`` of ``negatives`` exceed. A
+    candidate is flagged when its score is strictly above the threshold. With n negatives the
+    resolution is 1/n: below 20 negatives the threshold is simply the largest benign score."""
+    out = {}
+    for det in detectors:
+        vals = sorted(r[det] for r in negatives if det in r and r[det] == r[det])
+        if vals:
+            out[det] = vals[len(vals) - 1 - int(fpr * len(vals) + 1e-9)]
+    return out
+
+
+def flagged_by(row: dict, thresholds: dict[str, float]) -> list[str]:
+    """The detectors of ``thresholds`` whose score in ``row`` is strictly above its threshold,
+    in the order the thresholds are given. Scores that are used together flag a checkpoint
+    when this is not empty. A score that is missing or not a number flags nothing."""
+    return [det for det, threshold in thresholds.items() if det in row and row[det] > threshold]
+
+
+def held_out(negatives: list[dict], detectors: Iterable[str] = DETECTORS, fpr: float = 0.05) -> list[list[str]]:
+    """For each of ``negatives`` in turn, what it is ``flagged_by`` when the thresholds are set
+    by the others (``fpr_thresholds``). Thresholds flag at most ``fpr`` of the negatives they
+    were set on by construction, and every further score that is used gives a negative one
+    more threshold to be above; this counts what that comes to on negatives the thresholds
+    have not seen."""
+    detectors = tuple(detectors)
+    return [flagged_by(r, fpr_thresholds(negatives[:i] + negatives[i + 1:], detectors, fpr)) for i, r in enumerate(negatives)]
+
+
+def plot_frontier(
+    rows: list[dict],
+    path: str | Path,
+    thresholds: dict[str, float] | None = None,
+    checkpoints: list[dict] | None = None,
+    detectors: Iterable[str] = DETECTORS,
+) -> None:
     """One panel per detector: x = bypass rate, y = detector score, colour = k, marker = band.
     ``thresholds`` (detector -> score) draws the operating point from benign negatives, so the
-    region below the line and to the right is "refusal gone, detector silent"."""
+    region below the line and to the right is "refusal gone, detector silent". ``checkpoints``
+    (rows from ``detect_checkpoints.py``) overlays public models: red stars for edited ones,
+    grey crosses for benign fine-tunes."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    detectors = [d for d in detectors if any(d in r for r in rows)]
     ks = sorted({r["k"] for r in rows})
     bands = sorted({r["band"] for r in rows})
     markers = ["o", "s", "^", "D", "v", "P", "X"]
     cmap = plt.get_cmap("viridis", max(len(ks), 2))
-    fig, axes = plt.subplots(1, len(DETECTORS), figsize=(4.2 * len(DETECTORS), 3.8), sharex=True)
-    for ax, det in zip(axes, DETECTORS):
+    fig, axes = plt.subplots(1, len(detectors), figsize=(4.2 * len(detectors), 3.8), sharex=True, squeeze=False)
+    axes = axes[0]
+    for ax, det in zip(axes, detectors):
+        for c in checkpoints or []:
+            if det not in c or "bypass_rate" not in c or c[det] != c[det]:
+                continue
+            label = c.get("label", "")
+            if label.startswith("abliterated"):
+                style = dict(marker="*", s=110, color="crimson", edgecolor="white", zorder=4)
+            elif label == "other_edit":
+                style = dict(marker="P", s=60, color="darkorange", edgecolor="white", zorder=3)
+            else:
+                style = dict(marker="x", s=28, color="0.55", zorder=1)
+            ax.scatter(c["bypass_rate"], c[det], linewidths=1, **style)
         for r in rows:
+            if det not in r:
+                continue
             ax.scatter(
                 r["bypass_rate"],
                 r[det],
@@ -169,6 +269,13 @@ def plot_frontier(rows: list[dict], path: str | Path, thresholds: dict[str, floa
     axes[0].set_ylabel("detector score")
     handles = [plt.Line2D([], [], color=cmap(i), marker="o", ls="", label=f"k={k}") for i, k in enumerate(ks)]
     handles += [plt.Line2D([], [], color="k", marker=markers[i % len(markers)], ls="", label=b) for i, b in enumerate(bands)]
+    if checkpoints:
+        handles.append(plt.Line2D([], [], color="crimson", marker="*", ls="", ms=10, label="public, edited"))
+        handles.append(plt.Line2D([], [], color="0.55", marker="x", ls="", label="public, benign"))
+        if any(c.get("label") == "other_edit" for c in checkpoints):
+            handles.append(plt.Line2D([], [], color="darkorange", marker="P", ls="", label="public, other edit"))
+    if thresholds:
+        handles.append(plt.Line2D([], [], color="gray", ls="--", lw=1, label="benign threshold"))
     fig.legend(handles=handles, loc="upper center", ncol=len(handles), fontsize=8, bbox_to_anchor=(0.5, 1.02))
     fig.suptitle("marker size = alpha", y=1.08, fontsize=8)
     fig.tight_layout()

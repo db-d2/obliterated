@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
 import pytest
 import torch
 from tokenizers import Tokenizer, models, pre_tokenizers
@@ -21,6 +24,15 @@ TEMPLATE = (
     "<bos> {% for m in messages %}<|{{ m['role'] }}|> {{ m['content'] }} {% endfor %}"
     "{% if add_generation_prompt %}<|assistant|>{% endif %}"
 )
+
+
+def load_script(name: str):
+    """A file under scripts/ as a module, without running its ``main``."""
+    path = Path(__file__).resolve().parents[1] / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.fixture(scope="session")

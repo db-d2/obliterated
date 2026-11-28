@@ -8,6 +8,12 @@ Writes runs/<model>/frontier.jsonl (one row per attack point, appended across in
 and runs/<model>/frontier.png. If --edit is omitted the source layer is chosen by the Arditi
 procedure on the training split first. Pass --negatives runs/detect/benign.jsonl (from
 scripts/detect_checkpoints.py) to draw detector thresholds at 5% false-positive rate.
+
+With --divergence-tokens t, every point is also measured against the unedited model over whole
+answers: the model's own greedy answers to the held-out harmless prompts, t tokens of each, are
+fed back to it under the edit, and the row gets the answer_* columns of obliterated.divergence
+beside the first-token KL. Give a sweep that is run again for this an --out of its own: rows
+are appended, and a second row for a point is not told apart from the first.
 """
 
 from __future__ import annotations
@@ -33,13 +39,17 @@ def main() -> None:
     ap.add_argument("--alphas", default="0.25,0.5,0.75,1.0")
     ap.add_argument("--ks", default="1,2,4")
     ap.add_argument("--bands", default="all,mid,source,source±2")
-    ap.add_argument("--mode", default="hooks", choices=["hooks", "weights"])
+    ap.add_argument("--mode", default="hooks", choices=["hooks", "weights", "readers"],
+                    help="hooks: runtime ablation. weights: orthogonalize the writer matrices. readers: leave the "
+                         "writers alone and make the matrices that read the stream ignore the direction")
     ap.add_argument("--method", default="pca", choices=["pca", "iterative"])
     ap.add_argument("--source", default="arditi", choices=["arditi", "advbench", "harmbench"])
     ap.add_argument("--n-train", type=int, default=128)
     ap.add_argument("--n-val", type=int, default=64)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--negatives", default=None, help="JSONL of detector rows for benign fine-tunes")
+    ap.add_argument("--divergence-tokens", type=int, default=0,
+                    help="also measure every point against the unedited model over this many tokens of its own answer to each held-out harmless prompt")
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default="runs")
     args = ap.parse_args()
@@ -75,19 +85,16 @@ def main() -> None:
     ref_dirs = detect.reference_directions(lm, h_tr, s_tr, pos, bs)
     rows = sweep.run_sweep(
         lm, sub, h_val, s_val, parse_list(args.alphas, float), ks, bands, args.mode, ref_dirs, batch_size=bs,
-        tag=f"{args.method}",
+        tag=f"{args.method}", answer_tokens=args.divergence_tokens,
     )
     sweep.write_rows(rows, out / "frontier.jsonl")
 
     thresholds = None
     if args.negatives:
-        neg = sweep.read_rows(args.negatives)
-        thresholds = {}
-        for det in sweep.DETECTORS:
-            vals = sorted(r[det] for r in neg if det in r)
-            if vals:
-                thresholds[det] = vals[min(len(vals) - 1, int(0.95 * len(vals)))]
-                print(f"{det}: AUROC {sweep.frontier_auroc(rows, neg, det):.3f}")
+        neg = sweep.benign(sweep.read_rows(args.negatives))
+        thresholds = sweep.fpr_thresholds(neg)
+        for det in thresholds:
+            print(f"{det}: AUROC {sweep.frontier_auroc(rows, neg, det):.3f}")
     sweep.plot_frontier(sweep.read_rows(out / "frontier.jsonl"), out / "frontier.png", thresholds)
     for r in rows:
         print(

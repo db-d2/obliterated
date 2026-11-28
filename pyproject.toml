@@ -16,6 +16,9 @@ dependencies = [
     "pyyaml>=6.0",
     "tqdm>=4.66",
     "matplotlib>=3.9",
+    "sentencepiece>=0.2",
+    "protobuf>=5",
+    "peft>=0.14",
 ]
 
 [project.optional-dependencies]
